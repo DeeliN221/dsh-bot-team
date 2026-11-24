@@ -49,7 +49,7 @@ export class BackgroundInteractions {
 
   memberFor(agent) {
     const agents = this.ctx.agents;
-    if (!agent || !agents || agents.get(agent.id) !== agent || !agents.roots().includes(agent) || agent.session?.id !== agent.id) return;
+    if (!agent || !agents || agents.get(agent.id) !== agent || (typeof agents.roots === 'function' && !agents.roots().includes(agent)) || agent.session?.id !== agent.id) return;
     const members = [...this.repo.members.values()].filter(member => isCurrentMemberSession(this.repo, member, agent.id) && this.repo.groups.has(member.groupId));
     return members.length === 1 ? members[0] : undefined;
   }
