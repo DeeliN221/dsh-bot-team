@@ -105,7 +105,7 @@ export async function collectNativeConversationBlockers({ ctx, repo, pool, group
   const observed = new Map();
   const checkLive = (agent, member, isRoot = false) => {
     const details = { sessionId: agent.id, membershipId: member?.membershipId };
-    if (isRoot && (!agents.roots().includes(agent) || !pool?.owns?.(agent))) {
+    if (isRoot && (!(typeof agents.roots !== 'function' || agents.roots().includes(agent)) || !pool?.owns?.(agent))) {
       add('native-borrowed', '原生会话由其他所有者持有，无法关闭独立输入', details);
     }
     if (agent.status !== 'idle') add('native-agent', agent.status === 'running' ? '原生 Agent 仍在运行' : '无法确认原生 Agent 已空闲', details);
