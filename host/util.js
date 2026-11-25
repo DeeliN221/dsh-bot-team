@@ -41,6 +41,9 @@ export function resolveConfig(raw = {}) {
     resultMode: raw.resultMode === 'final' ? 'final' : 'full',
     // Extra absolute roots whose files the native `present` tool may expose in
     // the group timeline; the Bot working directory is always allowed.
+    // 'bot-team' opts the client into the Bot Team daily landing; everything
+    // else keeps the host's own default so the migration is config-gated.
+    defaultLanding: raw.defaultLanding === 'bot-team' ? 'bot-team' : 'auto',
     deliveryRoots: Array.isArray(raw.deliveryRoots)
       ? raw.deliveryRoots.filter(root => typeof root === 'string' && path.isAbsolute(root)).map(root => path.resolve(root))
       : [],

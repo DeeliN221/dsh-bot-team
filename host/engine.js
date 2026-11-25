@@ -22,7 +22,7 @@ import {
   buildTurnPrompt,
   parseReviewVerdict,
 } from './prompt.js';
-import { readFile, stat } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { newId, now, withTimeout } from './util.js';
 import { DiscussionRunner } from './discussion-runner.js';
@@ -30,12 +30,54 @@ import { isDiscussionActive } from './discussion-flow.js';
 import { LastRequestMetrics } from './message-metrics.js';
 import { currentConversationId, conversationFloor, conversationIdOf, isCurrentMemberSession } from './conversations.js';
 
+const sameConversation = (left, right) => (left ?? null) === (right ?? null);
 const executionSeq = (value) => Number.isSafeInteger(value) && value >= 0;
 const executionTurn = (value) => Number.isSafeInteger(value) && value > 0;
 const executionEvent = (type) => typeof type === 'string';
 /** `present` declares at most four files; reuse the upload cap for bytes. */
 const MAX_DELIVERABLE_FILES = 4;
 const MAX_DELIVERABLE_BYTES = 32 * 1024 * 1024;
+
+/** A step phase recorded in a Codex signature string, or null for opaque data. */
+function signaturePhaseOf(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  const candidates = start >= 0 && end > start ? [text, text.slice(start, end + 1)] : [text];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed.phase === 'string' && parsed.phase.length > 0) return parsed.phase;
+    } catch {
+      /* an opaque signature carries no phase */
+    }
+  }
+  return null;
+}
+
+/** Collect every recorded step phase from message.source.replayState signatures. */
+function stepPhases(message) {
+  const phases = [];
+  const seen = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (key === 'textSignature' || key === 'signature') {
+        const phase = signaturePhaseOf(item);
+        if (phase) phases.push(phase);
+      } else visit(item);
+    }
+  };
+  visit(message?.source?.replayState);
+  return phases;
+}
 
 export class Engine {
   constructor({ ctx, repo, pool, personas, bus, config, logger, quotaGuard, taskHook, workspaceGuard, assertAdmission, discussionGuard }) {
@@ -58,6 +100,8 @@ export class Engine {
     this.queue = [];
     this.running = new Map(); // membershipId -> job
     this.activeBySession = new Map(); // sessionId -> job
+    this.historicalBySession = new Map(); // sessionId -> closed-conversation job
+    this.settledTurns = new Map(); // sessionId -> Set<turn> already settled
     this.waiters = new Map(); // groupId -> [{ resolve }]
     this.discussionWaiters = new Map(); // discussionId -> [{ resolve }]
     this.disposed = false;
@@ -118,19 +162,80 @@ export class Engine {
   }
 
   /**
-   * A submitted job whose conversation rotated but whose own native session is
-   * untouched may still deliver its result to the original placeholder. Any
-   * change of the member's session mapping, Agent disposal, or a still-current
-   * conversation keeps the legacy stale behavior.
+   * Persisted session ownership: the only accepted proof that a session still
+   * belongs to a group/bot/conversation after the timeline moved on.
+   */
+  sessionBinding(sessionId) {
+    if (!sessionId || typeof this.repo.sessionBindingFor !== 'function') return null;
+    let binding;
+    try { binding = this.repo.sessionBindingFor(sessionId); } catch { return null; }
+    if (!binding || typeof binding !== 'object') return null;
+    if (typeof binding.groupId !== 'string' || !binding.groupId) return null;
+    if (typeof binding.botId !== 'string' || !binding.botId) return null;
+    if (typeof binding.membershipId !== 'string' || !binding.membershipId) return null;
+    if (typeof binding.conversationId !== 'string' || !binding.conversationId) return null;
+    if (binding.sessionId && binding.sessionId !== sessionId) return null;
+    if (!this.repo.getGroup?.(binding.groupId) || !this.repo.getBot?.(binding.botId)) return null;
+    if (!this.isBoundConversation(binding.groupId, binding.conversationId)) return null;
+    return binding;
+  }
+
+  isBoundConversation(groupId, conversationId) {
+    if (!groupId || !conversationId) return false;
+    if (typeof this.repo.sessionBindingsOf === 'function') {
+      let bindings;
+      try { bindings = this.repo.sessionBindingsOf(groupId, conversationId); } catch { return false; }
+      return Array.isArray(bindings) &&
+        bindings.some(binding => binding?.groupId === groupId && binding.conversationId === conversationId);
+    }
+    let conversation;
+    try { conversation = this.repo.conversationFor?.({ groupId, conversationId }); } catch { return false; }
+    return Boolean(conversation && conversation.groupId === groupId && conversation.conversationId === conversationId);
+  }
+
+  bindingMatches(binding, job) {
+    if (!binding || !job) return false;
+    if (binding.groupId !== job.groupId) return false;
+    if (binding.membershipId !== job.membershipId) return false;
+    if (binding.conversationId !== job.conversationId) return false;
+    if (job.sessionId && binding.sessionId && binding.sessionId !== job.sessionId) return false;
+    const botId = job.botId ?? this.repo.getMember?.(job.membershipId)?.botId;
+    return Boolean(botId) && binding.botId === botId;
+  }
+
+  /**
+   * A submitted job whose conversation rotated, but whose own native session is
+   * still bound and owned, may deliver its result to the original placeholder.
    */
   isLateDelivery(job) {
     if (!job || !job.submitted || this.isCurrentJob(job)) return false;
     const current = currentConversationId(this.repo, job.groupId);
     if (!current || current === job.conversationId) return false;
-    const member = this.repo.getMember(job.membershipId);
-    if (!member || member.groupId !== job.groupId) return false;
-    if (!job.sessionId || member.sessionId !== job.sessionId) return false;
-    return this.activeBySession.get(job.sessionId) === job;
+    if (!job.sessionId || this.activeBySession.get(job.sessionId) !== job) return false;
+    const agent = this.ctx.agents.get?.(job.sessionId);
+    if (agent && typeof this.pool.owns === 'function' && !this.pool.owns(agent)) return false;
+    return this.bindingMatches(this.sessionBinding(job.sessionId), job);
+  }
+
+  /** A closed-conversation turn adopted from its old native session. */
+  isHistoricalJob(job) {
+    if (!job || job.historical !== true || !job.sessionId) return false;
+    if (this.historicalBySession.get(job.sessionId) !== job) return false;
+    return this.bindingMatches(this.sessionBinding(job.sessionId), job);
+  }
+
+  /**
+   * Settlement may only touch the reply the job itself created; foreign jobs
+   * additionally need their persisted session binding to still prove identity.
+   */
+  canSettleMessage(job, message) {
+    if (!job || !message) return false;
+    if (message.groupId !== job.groupId || !sameConversation(message.conversationId, job.conversationId)) return false;
+    if (this.isCurrentJob(job)) return true;
+    // A job that never reached a native session produced its own terminal state
+    // (admission/member-mapping failure), so no stale session can answer it.
+    if (job.submitted !== true) return true;
+    return this.bindingMatches(this.sessionBinding(job.sessionId), job);
   }
 
   assertJobCurrent(job) {
@@ -211,10 +316,14 @@ export class Engine {
   }
 
   // ── message helpers ──────────────────────────────────────────────────────
-  createMessage(fields) {
+  createMessage(fields, options = {}) {
     const conversationId = fields.conversationId ?? currentConversationId(this.repo, fields.groupId);
     if (conversationId !== currentConversationId(this.repo, fields.groupId)) {
-      throw Object.assign(new Error('本次执行所属会话已结束'), { code: 'stale-conversation' });
+      // Only a persisted session binding may address a closed conversation.
+      const proof = options.binding;
+      const proven = proof && typeof proof === 'object' && proof.groupId === fields.groupId &&
+        proof.conversationId === conversationId && this.isBoundConversation(fields.groupId, conversationId);
+      if (!proven) throw Object.assign(new Error('本次执行所属会话已结束'), { code: 'stale-conversation' });
     }
     const seq = this.repo.allocateSeq(fields.groupId);
     const message = {
@@ -316,30 +425,44 @@ export class Engine {
     const store = this.ctx.get?.('attachments');
     if (!message || typeof store?.saveFile !== 'function' || !Array.isArray(data?.files)) return;
     const agent = job.sessionId ? this.ctx.agents.get(job.sessionId) : undefined;
-    const cwd = agent?.session?.header?.cwd;
-    const roots = [cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]
-      .filter(root => typeof root === 'string' && path.isAbsolute(root))
-      .map(root => path.resolve(root));
+    // A released Agent (exactly the rotation/restart case) still owns a group
+    // workspace; without it, presented files would be dropped silently.
+    const group = this.repo.getGroup(job.groupId);
+    const cwd = agent?.session?.header?.cwd
+      ?? group?.projectWorkspaceCwd
+      ?? group?.workspaceCwd
+      ?? this.config.defaultCwd;
+    const roots = [];
+    for (const candidate of [cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]) {
+      if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) continue;
+      const resolvedRoot = path.resolve(candidate);
+      try { roots.push(await realpath(resolvedRoot)); }
+      catch { roots.push(resolvedRoot); }
+    }
     if (roots.length === 0) return;
     job.deliveredFiles = job.deliveredFiles || new Set();
     for (const file of data.files) {
       if (job.deliveredFiles.size >= MAX_DELIVERABLE_FILES) break;
       if (!file || typeof file.path !== 'string' || file.path.length === 0) continue;
       const target = path.resolve(cwd || roots[0], file.path);
-      if (!roots.some(root => target === root || target.startsWith(root + path.sep))) {
-        this.logger?.warn?.('bot-team: presented file outside the Bot workspace: ' + target);
-        continue;
-      }
       if (job.deliveredFiles.has(target)) continue;
       // Reserve before the first await so concurrent events cannot attach twice.
       job.deliveredFiles.add(target);
       try {
-        const info = await stat(target);
-        if (!info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
+        // Follow symlinks only after confirming the real target stays inside an
+        // allowed root, so a link cannot expose an arbitrary host file.
+        const resolved = await realpath(target);
+        const info = await lstat(target);
+        if (info.isSymbolicLink() || !info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
           job.deliveredFiles.delete(target);
           continue;
         }
-        const ref = await store.saveFile({ data: new Uint8Array(await readFile(target)), name: path.basename(target) });
+        if (!roots.some(root => resolved === root || resolved.startsWith(root + path.sep))) {
+          job.deliveredFiles.delete(target);
+          this.logger?.warn?.('bot-team: presented file resolves outside the Bot workspace: ' + resolved);
+          continue;
+        }
+        const ref = await store.saveFile({ data: new Uint8Array(await readFile(resolved)), name: path.basename(target) });
         const current = this.repo.messages.get(job.placeholderId);
         if (!current) continue;
         if ((current.attachments || []).some(item => item?.attachmentId === ref.attachmentId)) continue;
@@ -492,7 +615,6 @@ export class Engine {
     job.streamText = '';
     job.stepCount = 0;
     job.finalAnswerText = '';
-    job.lastAssistantText = '';
     job.finalAnswerStep = null;
     job.requestMetrics = new LastRequestMetrics();
     job.finished = false;
@@ -660,9 +782,12 @@ export class Engine {
   }
 
   async persistExecution(job, patch, seq = null) {
-    if (!this.isCurrentJob(job) && !this.isLateDelivery(job)) this.assertJobCurrent(job);
+    if (!this.isCurrentJob(job) && !this.isLateDelivery(job) && !this.isHistoricalJob(job)) this.assertJobCurrent(job);
     const message = this.repo.messages.get(job.placeholderId);
     if (!message) throw new Error('无法保存执行记录：回复消息不存在');
+    if (message.groupId !== job.groupId || !sameConversation(message.conversationId, job.conversationId)) {
+      throw Object.assign(new Error('执行记录与回复消息归属不一致'), { code: 'stale-conversation' });
+    }
     job.execution = { ...job.execution, ...patch };
     message.meta = { ...(message.meta || {}), execution: job.execution };
     message.updatedAt = now();
@@ -670,7 +795,7 @@ export class Engine {
     const saved = this.repo.putMessageStrict(message);
     await saved;
     if (job.stepId && this.isCurrentJob(job)) await this.discussionRunner.execution(job);
-    if (this.isCurrentJob(job)) this.emitExecutionUpdated(job, seq, true);
+    if (this.isCurrentJob(job) && job.historical !== true) this.emitExecutionUpdated(job, seq, true);
   }
 
   recordExecution(job, patch, seq) {
@@ -801,6 +926,63 @@ export class Engine {
     return job.finished ? null : job;
   }
 
+  /**
+   * A turn reported by an old native session after its job already settled
+   * (for example a task-centre outbox receipt) still belongs in the original
+   * conversation. Such jobs live outside running/activeBySession so queue and
+   * delivery semantics of the current conversation stay untouched.
+   */
+  adoptHistoricalTurn(session, event) {
+    if (event.type !== 'turn/start' || !executionTurn(event.data?.turn) || !executionSeq(event.seq)) return null;
+    const turn = event.data.turn;
+    const active = this.historicalBySession.get(session.id);
+    if (active) return !active.finished && active.turn === turn ? active : null;
+    if (this.activeBySession.has(session.id)) return null;
+    const binding = this.sessionBinding(session.id);
+    if (!binding) return null;
+    const current = currentConversationId(this.repo, binding.groupId);
+    // A binding pointing at the live conversation is the normal native path.
+    if (!current || binding.conversationId === current) return null;
+    if (this.settledTurns.get(session.id)?.has(turn)) return null;
+    const settled = (this.repo.messagesOf?.(binding.groupId) || []).some(message =>
+      message.status !== 'pending' && message.meta?.execution?.sessionId === session.id &&
+      message.meta.execution.turn === turn);
+    if (settled) return null;
+    const bot = this.repo.getBot(binding.botId);
+    if (!bot) return null;
+    const jobId = newId('job');
+    const job = {
+      jobId, groupId: binding.groupId, conversationId: binding.conversationId,
+      membershipId: binding.membershipId, botId: binding.botId, sessionId: session.id,
+      triggerSeq: 0, triggerMessageId: null, kind: 'native', messageKind: 'native',
+      historical: true, submitted: true, nativeInput: true, state: 'running',
+      turn, observedTurn: turn, observedTurnSeq: event.seq, turnStarts: new Map(),
+      steps: [], streamText: '', stepCount: 0, finalAnswerText: '', finalAnswerStep: null,
+      requestMetrics: new LastRequestMetrics(), following: [], awaitingContinuation: false,
+      ending: false, execution: {
+        version: 1, jobId, sessionId: session.id, inputMessageId: null,
+        turn, startSeq: event.seq, endSeq: null, submittedSeq: event.seq,
+      },
+      done: Promise.resolve(),
+    };
+    try {
+      const placeholder = this.createMessage({
+        groupId: job.groupId, conversationId: job.conversationId,
+        author: { type: 'bot', botId: binding.botId, membershipId: binding.membershipId, name: bot.name },
+        text: '', status: 'pending', kind: 'native',
+        provider: bot.provider ?? null, model: bot.model ?? null, reasoningEffort: bot.reasoningEffort ?? null,
+        meta: { nativeSession: true, historical: true, execution: job.execution },
+      }, { binding });
+      job.placeholderId = placeholder.messageId;
+      this.historicalBySession.set(session.id, job);
+      this.bus.emit(job.groupId, { type: 'message.added', message: placeholder });
+      return job;
+    } catch (error) {
+      this.logger?.warn?.('bot-team: historical delivery adoption failed: ' + String(error?.message || error));
+      return null;
+    }
+  }
+
   startNativeContinuation(job, session, event) {
     if (!this.isCurrentJob(job)) return false;
     try { this.admitConversation(job.groupId, job.conversationId); } catch { return false; }
@@ -815,7 +997,6 @@ export class Engine {
     job.streamText = '';
     job.stepCount = 0;
     job.finalAnswerText = '';
-    job.lastAssistantText = '';
     job.finalAnswerStep = null;
     job.streamAttemptId = null;
     job.usage = null;
@@ -851,8 +1032,9 @@ export class Engine {
     const live = this.ctx.agents.get(session.id);
     if (live?.session && live.session !== session) return;
     if (event.type === 'turn/end') this.discussionRunner.nativeSettled(session.id);
-    const job = this.activeBySession.get(session.id) || this.adoptNativeTurn(session, event);
-    if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job))) return;
+    const job = this.activeBySession.get(session.id) || this.historicalBySession.get(session.id) ||
+      this.adoptNativeTurn(session, event) || this.adoptHistoricalTurn(session, event);
+    if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job) && !this.isHistoricalJob(job))) return;
     if (job.ending) { job.following.push({ session, event }); return; }
     const data = event.data || {};
     if (job.awaitingContinuation) {
@@ -900,7 +1082,7 @@ export class Engine {
     }
     if (event.type === 'user/message' && correlated) {
       const inputId = data.id ?? data.message?.id;
-      if (job.nativeInput && !job.execution.inputMessageId && typeof inputId === 'string') {
+      if (job.nativeInput && job.historical !== true && !job.execution.inputMessageId && typeof inputId === 'string') {
         this.recordExecution(job, { inputMessageId: inputId }, event.seq);
       }
       if (inputId !== job.execution.inputMessageId) return;
@@ -913,13 +1095,18 @@ export class Engine {
     if (executionSeq(event.seq) && executionSeq(job.execution.startSeq) && event.seq < job.execution.startSeq) return;
 
     if (event.type === 'turn/end' && data.turn === job.turn && correlated && executionSeq(event.seq)) {
+      if (job.historical === true) {
+        job.execution = { ...job.execution, endSeq: event.seq };
+        this.finishTurn(job, data.reason);
+        return;
+      }
       job.ending = true;
       void this.persistExecution(job, { endSeq: event.seq }, event.seq)
         .then(() => this.finishTurn(job, data.reason))
         .catch((error) => this.executionFailed(job, error));
       return;
     }
-    if (executionSeq(event.seq) && executionEvent(event.type)) this.emitExecutionUpdated(job, event.seq);
+    if (executionSeq(event.seq) && executionEvent(event.type) && job.historical !== true) this.emitExecutionUpdated(job, event.seq);
     if (event.type === 'deliverables/presented' && data.turn === job.turn) {
       // Reuse the native attachment store; never let a failed projection fail
       // the turn or delay its settlement.
@@ -945,12 +1132,15 @@ export class Engine {
         .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
         .map((block) => block.text)
         .join('');
-      // Only a final answer is a step whose content has text but no tool call:
-      // the agent loop ends the turn right after such a message.
       if (this.config.resultMode === 'final') {
         job.stepCount = (job.stepCount || 0) + 1;
-        if (messageText) job.lastAssistantText = messageText;
-        if (messageText && !content.some((block) => block && block.type === 'tool-call')) {
+        // A recorded step phase outranks the shape heuristic: only an answer
+        // printed as final may be published, while a turn whose steps carry
+        // non-final phases never projects commentary as its result.
+        const phases = stepPhases(event.data.message);
+        const provenFinal = phases.includes('final_answer') ||
+          (phases.length === 0 && !content.some((block) => block && block.type === 'tool-call'));
+        if (messageText && provenFinal) {
           job.finalAnswerText = messageText;
           job.finalAnswerStep = job.stepCount;
         }
@@ -975,7 +1165,10 @@ export class Engine {
 
   finishTurn(job, reason = {}) {
     if (job.finished) return;
-    if (!this.isCurrentJob(job) && !this.isLateDelivery(job)) { this.finishJob(job, 'stopped', '本次执行所属会话已结束'); return; }
+    if (!this.isCurrentJob(job) && !this.isLateDelivery(job) && !this.isHistoricalJob(job)) {
+      this.finishJob(job, 'stopped', '本次执行所属会话已结束');
+      return;
+    }
     job.ending = false;
     if (reason.kind === 'completed') {
       if (this.isCurrentJob(job) &&
@@ -1087,16 +1280,20 @@ export class Engine {
     if (this.config.resultMode !== 'final') {
       return ((job.steps || []).filter(Boolean).join('\n\n') || job.streamText || '').trim();
     }
-    const finalAnswer = typeof job.finalAnswerText === 'string' ? job.finalAnswerText.trim() : '';
-    if (finalAnswer) return finalAnswer;
-    // Stopped/error/max-tokens turns fall back to their last non-empty step text,
-    // including commentary that carried a tool call.
-    return typeof job.lastAssistantText === 'string' ? job.lastAssistantText.trim() : '';
+    // Without a proven final answer the body stays empty: status, error and
+    // approval cards already carry the necessary state, and internal
+    // commentary must never reach the timeline.
+    return typeof job.finalAnswerText === 'string' ? job.finalAnswerText.trim() : '';
   }
 
   settleMessage(job, status, error, options = {}) {
     const text = this.projectedText(job);
     const message = job.placeholderId ? this.repo.messages.get(job.placeholderId) : undefined;
+    // Never persist or broadcast a reply this job cannot prove it owns.
+    if (message && !this.canSettleMessage(job, message)) {
+      this.logger?.warn?.(`bot-team: dropped reply settlement ${String(job.jobId)} (${status}) without a matching session binding`);
+      return undefined;
+    }
     if (message) {
       message.text = text;
       message.status = status;
@@ -1125,7 +1322,7 @@ export class Engine {
       this.bus.emit(job.groupId, { type: 'message.updated', message });
       // The accepted end event may have invalidated before this final status.
       // A null seq also refreshes stopped jobs and bypasses event deduplication.
-      this.emitExecutionUpdated(job, null, true);
+      if (job.historical !== true) this.emitExecutionUpdated(job, null, true);
     }
     return message;
   }
@@ -1137,7 +1334,7 @@ export class Engine {
     job.error = error || null;
     if (job.timer) clearTimeout(job.timer);
     const current = this.isCurrentJob(job);
-    const late = !current && this.isLateDelivery(job);
+    const late = !current && (this.isLateDelivery(job) || job.historical === true);
     if (job.sessionId && this.activeBySession.get(job.sessionId) === job) this.activeBySession.delete(job.sessionId);
     if (this.running.get(job.membershipId) === job) this.running.delete(job.membershipId);
 
@@ -1146,6 +1343,19 @@ export class Engine {
       for (const approvalId of [...job.approvalMessages.keys()]) {
         this.settleApproval(job, approvalId, 'cancelled');
       }
+    }
+    // Remember closed-conversation turns so a replayed receipt never re-opens
+    // one; current-conversation turns cannot be adopted as historical anyway.
+    if (!current && job.sessionId && executionTurn(job.turn)) {
+      const turns = this.settledTurns.get(job.sessionId) ?? new Set();
+      turns.add(job.turn);
+      this.settledTurns.set(job.sessionId, turns);
+    }
+    if (job.historical === true) {
+      // Closed-conversation delivery: clear only its own in-memory bookkeeping.
+      this.historicalBySession.delete(job.sessionId);
+      job.resolveDone?.();
+      return;
     }
     if (current) this.bus.emit(job.groupId, {
       type: 'member.status',
@@ -1177,15 +1387,15 @@ export class Engine {
       void advanced
         .finally(() => {
           this.pendingWork.delete(pending); job.resolveDone?.();
-          if (current) { this.pump(job.groupId); this.checkIdle(job.groupId); }
+          // Queue admission is conversation-scoped inside pump/startJob, so a
+          // late settlement must still release the member for the new queue.
+          this.pump(job.groupId); this.checkIdle(job.groupId);
         });
     } else {
       job.resolveDone?.();
-      if (current) {
-        this.pump(job.groupId);
-        this.afterJobFinished(job);
-        this.checkIdle(job.groupId);
-      }
+      this.pump(job.groupId);
+      if (current) this.afterJobFinished(job);
+      this.checkIdle(job.groupId);
     }
   }
 
@@ -1808,6 +2018,8 @@ export class Engine {
       /* noop */
     }
     this.queue = [];
+    this.historicalBySession.clear();
+    this.settledTurns.clear();
     for (const job of [...this.running.values()]) {
       try {
         this.abortJob(job, 'dispose');

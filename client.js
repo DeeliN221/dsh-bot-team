@@ -13771,10 +13771,54 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
      * @param ctx - client root context.
      * @returns disposer releasing every subscription it took.
      */
+    /**
+     * Whether the migration config opts into the Bot Team daily landing. Only an
+     * explicit `config.defaultLanding === 'bot-team'` may move the shell's own
+     * default; anything else (including a missing config) keeps the native one.
+     * @param payload - bootstrap payload, or anything shaped like it.
+     * @returns true when the landing is explicitly enabled.
+     */
+    function landingEnabled(payload) {
+      const config = payload && typeof payload === 'object' ? payload.config : null;
+      return !!config && typeof config === 'object' && config.defaultLanding === 'bot-team';
+    }
+
+    /**
+     * Gate the daily landing on the migration config, then hand over to the
+     * shell wiring. The bootstrap read is the only network call; an unreadable
+     * or disabled config leaves the host shell completely untouched.
+     * @param ctx - client root context.
+     * @returns disposer releasing the wiring, if it ever started.
+     */
     function installHostNavigation(ctx) {
       const layout = ctx && ctx.layout;
       if (!layout || typeof layout.selectPanel !== 'function'
         || !ctx.slots || typeof ctx.slots.entries !== 'function') return () => {};
+      let disposeNavigation = null;
+      let disposed = false;
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      Promise.resolve()
+        .then(() => api.bootstrap(controller ? controller.signal : undefined))
+        .then((payload) => {
+          if (disposed || !landingEnabled(payload)) return;
+          disposeNavigation = startHostNavigation(ctx, layout);
+        })
+        .catch(() => { /* an unreadable bootstrap keeps the native default */ });
+      return () => {
+        disposed = true;
+        if (controller) controller.abort();
+        if (disposeNavigation) disposeNavigation();
+      };
+    }
+
+    /**
+     * The enabled form of {@link installHostNavigation}: boot landing, sidebar
+     * choreography, and memory of the user's own panel pick.
+     * @param ctx - client root context.
+     * @param layout - the shell's layout face (`ctx.layout`).
+     * @returns disposer releasing every subscription it took.
+     */
+    function startHostNavigation(ctx, layout) {
       // Public API exposes the sidebar write (`toggleSidebar`) but not its
       // folded state, so the frame's own rendered marker is the observation
       // point: the shell overlay seat is always painted and the frame element

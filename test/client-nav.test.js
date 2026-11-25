@@ -21,6 +21,18 @@ const memory = () => {
 
 const state = (overrides = {}) => ({ bootstrapped: false, projectId: null, ...overrides });
 
+// ── landing switch ────────────────────────────────────────────────────────
+
+test('the daily landing requires an explicit migration opt-in', () => {
+  assert.equal(client.landingEnabled({ config: { defaultLanding: 'bot-team' } }), true);
+  assert.equal(client.landingEnabled({ config: { defaultLanding: 'conversation' } }), false);
+  assert.equal(client.landingEnabled({ config: {} }), false);
+  assert.equal(client.landingEnabled({ ok: true }), false);
+  assert.equal(client.landingEnabled({ config: null }), false);
+  assert.equal(client.landingEnabled(null), false);
+  assert.equal(client.landingEnabled('bot-team'), false);
+});
+
 // ── boot landing ──────────────────────────────────────────────────────────
 
 test('a fresh load lands on Bot Team when nothing else was explicitly chosen', () => {
@@ -198,44 +210,61 @@ function shell({ collapsed = false, narrow = false, installed = [PAGE] } = {}) {
   };
 }
 
+// The landing is gated on the migration config read through the bootstrap
+// route; every integration case below has to let that promise chain settle.
+const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+const bootstrapFetch = (config, { fail = false } = {}) => () => (fail
+  ? Promise.reject(new Error('host unreachable'))
+  : Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, ...(config === undefined ? {} : { config }) }) }));
+
 function wired(options = {}) {
   const fake = shell(options);
   const store = memory();
-  const client = loadClient({ document: fake.document, localStorage: store, window: { innerWidth: options.narrow ? 900 : 1440 } });
+  const client = loadClient({
+    document: fake.document,
+    localStorage: store,
+    window: { innerWidth: options.narrow ? 900 : 1440 },
+    fetch: options.fetch || bootstrapFetch({ defaultLanding: 'bot-team' }),
+  });
   const dispose = client.installHostNavigation(fake.ctx);
   // Assigned onto the shell double (not spread) so its live getters survive.
   return Object.assign(fake, { client, store, dispose });
 }
 
-test('the running shell opens Bot Team on a fresh load and folds its sidebar', () => {
+test('the running shell opens Bot Team on a fresh load and folds its sidebar', async () => {
   const run = wired();
+  await flush();
   assert.deepEqual(run.calls.select, [PAGE], 'exactly one boot selection');
   assert.equal(run.calls.toggles, 1);
   assert.equal(run.collapsed, true);
   run.dispose();
 });
 
-test('a narrow shell keeps its responsive sidebar and still opens Bot Team', () => {
+test('a narrow shell keeps its responsive sidebar and still opens Bot Team', async () => {
   const run = wired({ narrow: true });
+  await flush();
   assert.deepEqual(run.calls.select, [PAGE]);
   assert.equal(run.calls.toggles, 0);
   run.dispose();
 });
 
-test('the user keeping another panel is remembered, not overwritten', () => {
+test('the user keeping another panel is remembered, not overwritten', async () => {
   const store = memory();
   store.setItem('bot-team.host.panel', 'plugins');
   const fake = shell({ installed: [PAGE, 'plugins'] });
   const client = loadClient({ document: fake.document, localStorage: store, window: { innerWidth: 1440 } });
   const dispose = client.installHostNavigation(fake.ctx);
+  await flush();
   assert.deepEqual(fake.calls.select, [], 'the explicit choice is not reclaimed');
   assert.equal(fake.calls.toggles, 0, 'no Bot Team flow ran, so the sidebar stays as the host left it');
   assert.equal(store.getItem('bot-team.host.panel'), 'plugins');
   dispose();
 });
 
-test('entering a project expands the folded sidebar, and a later collapse stands', () => {
+test('entering a project expands the folded sidebar, and a later collapse stands', async () => {
   const run = wired();
+  await flush();
   assert.equal(run.collapsed, true, 'boot folded it');
   run.enterProject('ws-1');
   assert.equal(run.collapsed, false, 'project entry expanded it');
@@ -250,8 +279,9 @@ test('entering a project expands the folded sidebar, and a later collapse stands
   run.dispose();
 });
 
-test('returning to the daily Bot Team page folds the tree again', () => {
+test('returning to the daily Bot Team page folds the tree again', async () => {
   const run = wired();
+  await flush();
   run.enterProject('ws-1');
   assert.equal(run.collapsed, false);
   run.setPanel(PAGE);
@@ -259,14 +289,39 @@ test('returning to the daily Bot Team page folds the tree again', () => {
   run.dispose();
 });
 
-test('an explicit panel pick is remembered for the next fresh load', () => {
+test('an explicit panel pick is remembered for the next fresh load', async () => {
   const run = wired();
+  await flush();
   run.setPanel('plugins');
   assert.equal(run.store.getItem('bot-team.host.panel'), 'plugins');
   // Opening a project Session returns the shell to the Conversation.
   run.ctx.layout.selectPanel(null);
   assert.equal(run.store.getItem('bot-team.host.panel'), '', 'the Conversation clears the panel memory');
   run.dispose();
+});
+
+test('a config without the landing switch leaves the host shell untouched', async () => {
+  const run = wired({ fetch: bootstrapFetch({ defaultLanding: 'conversation' }) });
+  await flush();
+  assert.deepEqual(run.calls.select, [], 'no panel is selected');
+  assert.equal(run.calls.toggles, 0, 'the sidebar is not touched');
+  run.setPanel('plugins');
+  assert.equal(run.store.getItem('bot-team.host.panel'), null, 'nothing is remembered either');
+  run.dispose();
+});
+
+test('a missing or unreadable bootstrap keeps the native default', async () => {
+  for (const [label, fetch] of [
+    ['no config', bootstrapFetch(undefined)],
+    ['host unreachable', bootstrapFetch(null, { fail: true })],
+    ['null payload', () => Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, config: null }) })],
+  ]) {
+    const run = wired({ fetch });
+    await flush();
+    assert.deepEqual(run.calls.select, [], label);
+    assert.equal(run.calls.toggles, 0, label);
+    run.dispose();
+  }
 });
 
 test('a shell without the layout service is left untouched', () => {

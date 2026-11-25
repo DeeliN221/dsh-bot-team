@@ -500,6 +500,8 @@ export class BotTeamService {
         botSandbox: this.config.botSandbox,
         botApprovalPolicy: this.config.botApprovalPolicy,
         dailyTokenBudget: this.config.dailyTokenBudget,
+        defaultLanding: this.config.defaultLanding,
+        resultMode: this.config.resultMode,
         schemaVersion: this.repo.schemaVersion(),
       },
       plugin: PLUGIN_INFO,
@@ -900,19 +902,24 @@ export class BotTeamService {
       const groupId = String(url.searchParams.get('groupId') || '');
       const attachmentId = String(url.searchParams.get('attachmentId') || '');
       const name = String(url.searchParams.get('name') || '');
-      const rawBytes = Number(url.searchParams.get('bytes'));
+      const rawBytes = url.searchParams.get('bytes');
       if (!groupId || !attachmentId || !name) return json(fail('invalid-input', '附件参数不完整'), 400);
       if (!this.repo.getGroup(groupId)) return json(fail('not-found', `群 ${groupId} 不存在`), 404);
-      const bytes = Number.isSafeInteger(rawBytes) && rawBytes >= 0 ? rawBytes : undefined;
-      const published = this.repo.messagesOf(groupId).some(message => (message.attachments || []).some(attachment =>
-        attachment && attachment.attachmentId === attachmentId && attachment.name === name
-        && (bytes === undefined || attachment.bytes === bytes)));
+      const requested = rawBytes !== null && /^\d+$/.test(rawBytes) ? Number(rawBytes) : undefined;
+      const bytes = Number.isSafeInteger(requested) && requested >= 0 ? requested : undefined;
+      let published;
+      for (const message of this.repo.messagesOf(groupId)) {
+        published = (message.attachments || []).find(attachment => attachment
+          && attachment.attachmentId === attachmentId && attachment.name === name
+          && (bytes === undefined || attachment.bytes === bytes));
+        if (published) break;
+      }
       if (!published) return json(fail('not-found', '附件不属于该群消息'), 404);
       const store = this.attachmentStore();
       if (!store) return json(fail('unavailable', '附件服务不可用'), 503);
       let hostPath;
       try {
-        hostPath = store.fileHostPath({ attachmentId, name, bytes: bytes ?? 0 });
+        hostPath = store.fileHostPath({ attachmentId, name, bytes: published.bytes });
       } catch {
         return json(fail('not-found', '附件不可用'), 404);
       }

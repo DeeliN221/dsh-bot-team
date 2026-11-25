@@ -87,11 +87,17 @@ function fixture(t, options = {}) {
       engine.onInboxClaim({ agent: agents.get(job.sessionId), message: { id: job.execution.inputMessageId }, turn });
       f.event(job, 'user/message', { id: job.execution.inputMessageId, turn });
     },
-    answer(job, text, { toolCall = false } = {}) {
+    answer(job, text, { toolCall = false, phase } = {}) {
       const content = [];
       if (toolCall) content.push({ type: 'tool-call', callId: 'call-1', name: 'bash', arguments: '{}' });
       content.push({ type: 'text', text });
-      f.event(job, 'assistant/message', { turn: job.turn, message: { content } });
+      const message = { content };
+      if (phase) {
+        message.source = {
+          replayState: { attempts: [{ blocks: [{ textSignature: JSON.stringify({ v: 1, id: 'sig-' + phase, phase }) }] }] },
+        };
+      }
+      f.event(job, 'assistant/message', { turn: job.turn, message });
     },
     end(job, reason = { kind: 'completed' }) { f.event(job, 'turn/end', { turn: job.turn, reason }); },
     streamStart(job, attemptId = 'attempt-1') {
@@ -146,7 +152,7 @@ test('final mode keeps the placeholder empty while steps stream', async t => {
   assert.equal(f.framesOfType('message.delta').length, 0);
 });
 
-test('final mode falls back to the last non-empty step text and keeps status/error', async t => {
+test('final mode keeps the body empty without a proven final answer and keeps status/error', async t => {
   const cases = [
     { run: (f, job) => f.engine.abortJob(job, 'user'), status: 'stopped', error: '已停止' },
     { run: (f, job) => f.end(job, { kind: 'error', error: { message: 'boom' } }), status: 'error', error: 'boom' },
@@ -157,13 +163,48 @@ test('final mode falls back to the last non-empty step text and keeps status/err
     const { job } = await f.post();
     f.begin(job);
     f.answer(job, 'DRAFT WITH TOOL CALL', { toolCall: true });
+    f.answer(job, 'COMMENTARY WITH PHASE', { phase: 'commentary' });
     scenario.run(f, job);
     await f.flush();
     const message = f.message(job);
-    assert.equal(message.text, 'DRAFT WITH TOOL CALL');
+    assert.equal(message.text, '');
     assert.equal(message.status, scenario.status);
     assert.equal(message.error, scenario.error);
   }
+});
+
+test('final mode accepts a text step signed as final_answer', async t => {
+  const f = fixture(t, { resultMode: 'final' });
+  const { job } = await f.post();
+  f.begin(job);
+  f.answer(job, 'SIGNED FINAL', { phase: 'final_answer' });
+  f.end(job);
+  await f.flush();
+  assert.equal(f.message(job).text, 'SIGNED FINAL');
+  assert.equal(f.message(job).status, 'done');
+});
+
+test('final mode never publishes a text step whose recorded phase is commentary', async t => {
+  const f = fixture(t, { resultMode: 'final' });
+  const { job } = await f.post();
+  f.begin(job);
+  f.answer(job, 'COMMENTARY ONLY', { phase: 'commentary' });
+  f.end(job);
+  await f.flush();
+  const message = f.message(job);
+  assert.equal(message.text, '');
+  assert.equal(message.status, 'done');
+  assert.equal(f.framesOfType('message.replace').length, 0);
+});
+
+test('final mode still publishes an unsigned text-only step through the native fallback', async t => {
+  const f = fixture(t, { resultMode: 'final' });
+  const { job } = await f.post();
+  f.begin(job);
+  f.answer(job, 'UNSIGNED FINAL');
+  f.end(job);
+  await f.flush();
+  assert.equal(f.message(job).text, 'UNSIGNED FINAL');
 });
 
 test('final mode parses the review verdict from the final answer only', async t => {

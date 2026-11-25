@@ -8,11 +8,11 @@
 
 ### 新增
 
-- Host 发布只读 `botTeamIdentity` 服务：按持久成员绑定返回当前 Bot 会话或其原生子代理的冻结身份（`botId/membershipId/groupId/conversationId`），供部署策略插件按 Bot 授权；轮换会话不再回退到共享工作目录策略。
-- 新增 `resultMode: final` 简洁结果模式：只投影本 turn 的最终答案，中间步骤与流式正文不进入群消息，停止/报错保留最后文本与状态；默认 `full` 保持 1.3.0 行为。
-- 会话轮换或归档后，已提交作业的迟到结果写回原会话并标记 `meta.lateDelivery`，不投递新会话、不重复执行。
+- Host 发布只读 `botTeamIdentity` 服务：按持久成员绑定返回当前、历史（轮换/停用/移除后仍保留原角色）或经创建关系验证的原生子代理身份（`botId/membershipId/groupId/conversationId` + `current/historical`），供部署策略插件按 Bot 授权；Bot 会话不再回退到共享工作目录策略。
+- 新增 `resultMode: final` 简洁结果模式：只投影已证实最终答案，优先尊重原生 `textSignature` 的 `phase`，中间步骤、流式正文与内部 commentary 不进入群消息；无最终答案时正文为空，只保留状态/错误/审批。默认 `full` 保持 1.3.0 行为。
+- 会话轮换或归档后，已提交作业的迟到结果按持久 sessionBinding 写回原会话并标记 `meta.lateDelivery`；内存作业结束后，旧会话由任务中心投递的全新回报回合同样投影到原会话，重复 receipt/turn 不重复建消息。
 - Bot 通过原生 `present` 交付的文件进入群消息附件，可下载；复用原生附件存储，不新增文件卡片。
-- 日常默认落到 Bot Team 最近聊天，宿主侧栏默认收起并在进入项目时展开。
+- 新增 `defaultLanding: bot-team` 配置：启用后日常默认落到 Bot Team 最近聊天，宿主侧栏启动收起并在进入项目时展开；未启用保持宿主原生落点与侧栏行为。
 
 ### 调整与修复
 

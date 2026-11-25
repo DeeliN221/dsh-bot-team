@@ -23,5 +23,8 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(() => () => service.dispose(), 'bot-team lifecycle');
   // Identity is read through the live service; repo/pool appear after `ready`.
   const identity = createIdentityService(ctx, () => service);
-  ctx.effect(() => ctx.provide(IDENTITY_SERVICE_NAME, identity), 'bot-team identity');
+  ctx.effect(() => {
+    const unprovide = ctx.provide(IDENTITY_SERVICE_NAME, identity);
+    return () => { unprovide(); identity.dispose(); };
+  }, 'bot-team identity');
 }

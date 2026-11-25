@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { Engine } from '../host/engine.js';
@@ -13,12 +13,12 @@ async function fixture(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'bot-team-deliverable-'));
   const outside = await mkdtemp(path.join(os.tmpdir(), 'bot-team-outside-'));
   t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
-  const groups = new Map([['group', { groupId: 'group', title: 'Group', nextSeq: 0, activeConversationId: 'conv-1' }]]);
+  const groups = new Map([['group', { groupId: 'group', title: 'Group', nextSeq: 0, activeConversationId: 'conv-1', workspaceCwd: root }]]);
   const conversations = new Map([['conv-1', { conversationId: 'conv-1', groupId: 'group', ordinal: 1, afterSeq: 0 }]]);
   const members = new Map([['member', { membershipId: 'member', botId: 'bot', groupId: 'group', sessionId: 'session-1', sessionConversationId: 'conv-1', lastSeenSeq: 0 }]]);
   const bots = new Map([['bot', { botId: 'bot', name: 'Tester', provider: 'mock', model: 'mock' }]]);
   const messages = new Map();
-  const frames = []; const agents = new Map(); const saved = [];
+  const frames = []; const agents = new Map(); const sessions = new Map(); const saved = [];
   const repo = {
     groups, conversations, members, bots, messages,
     getGroup: id => groups.get(id), getMember: id => members.get(id), getBot: id => bots.get(id), getMessage: id => messages.get(id),
@@ -53,12 +53,11 @@ async function fixture(t, options = {}) {
   };
   const ctx = { on: () => () => {}, get: name => (name === 'attachments' ? attachments : undefined), agents: { get: id => agents.get(id) } };
   function agent(sessionId) {
-    if (!agents.has(sessionId)) agents.set(sessionId, {
-      id: sessionId,
-      session: { id: sessionId, seq: 0, header: { id: sessionId, cwd: root }, events: [], snapshotEvents() { return this.events; } },
-      cancel() {},
-      followup: async () => {},
-    });
+    if (!agents.has(sessionId)) {
+      const session = { id: sessionId, seq: 0, header: { id: sessionId, cwd: root }, events: [], snapshotEvents() { return this.events; } };
+      sessions.set(sessionId, session);
+      agents.set(sessionId, { id: sessionId, session, cancel() {}, followup: async () => {} });
+    }
     return agents.get(sessionId);
   }
   agent('session-1');
@@ -74,8 +73,11 @@ async function fixture(t, options = {}) {
     taskHook: () => {}, bus: { emit: (groupId, frame) => frames.push({ groupId, ...structuredClone(frame) }) },
   });
   const f = {
-    root, outside, repo, engine, frames, saved,
-    async flush() { for (let index = 0; index < 40; index += 1) await tick(); },
+    root, outside, repo, engine, frames, saved, agents, sessions,
+    async flush() {
+      // realpath/lstat/read round-trips need real I/O turns, not only microtasks.
+      for (let index = 0; index < 20; index += 1) { await tick(); await new Promise(resolve => setTimeout(resolve, 2)); }
+    },
     async post() {
       const result = engine.postHumanMessage({ groupId: 'group', text: 'REQUEST', mentions: ['member'] });
       await f.flush();
@@ -87,7 +89,7 @@ async function fixture(t, options = {}) {
       f.event(job, 'user/message', { id: job.execution.inputMessageId, turn });
     },
     event(job, type, data) {
-      const session = agents.get(job.sessionId).session;
+      const session = sessions.get(job.sessionId);
       const event = { seq: session.seq++, type, data };
       session.events.push(event); engine.onSessionEvent(session, event); return event;
     },
@@ -162,4 +164,28 @@ test('at most four files are projected and missing files do not fail the turn', 
   await f.flush();
   assert.equal(f.message(job).attachments.length, 4);
   assert.deepEqual(f.message(job).attachments.map(item => item.name), ['f0.txt', 'f1.txt', 'f2.txt', 'f3.txt']);
+});
+
+test('a symlink inside the workspace cannot expose a file outside it', async t => {
+  const f = await fixture(t);
+  await writeFile(f.outsideFileOf('secret.txt'), 'secret');
+  await symlink(f.outsideFileOf('secret.txt'), f.fileOf('link.txt'));
+  const { job } = await f.post();
+  f.begin(job);
+  f.present(job, [{ path: 'link.txt' }]);
+  await f.flush();
+  assert.equal(f.message(job).attachments.length, 0);
+  assert.equal(f.saved.length, 0);
+});
+
+test('a released Agent still projects files through the group workspace', async t => {
+  const f = await fixture(t);
+  await writeFile(f.fileOf('after-release.md'), 'kept');
+  const { job } = await f.post();
+  f.begin(job);
+  f.agents.delete(job.sessionId);
+  f.present(job, [{ path: 'after-release.md' }]);
+  await f.flush();
+  assert.equal(f.message(job).attachments.length, 1);
+  assert.equal(f.message(job).attachments[0].name, 'after-release.md');
 });
