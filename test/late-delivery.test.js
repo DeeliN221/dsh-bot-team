@@ -59,12 +59,15 @@ function fixture(t, options = {}) {
     async ensure(id) { return agent(members.get(id).sessionId); },
     submit: (handle, input) => handle.followup(input),
   };
-  const engine = new Engine({
-    ctx, repo, pool, config: resolveConfig({ resultMode: options.resultMode }),
+  const config = resolveConfig({ resultMode: options.resultMode });
+  const makeEngine = () => new Engine({
+    ctx, repo, pool, config,
     personas: { refresh: async () => {} }, logger: { warn: text => warnings.push(text) },
     taskHook: (...args) => hooks.push(args),
     bus: { emit: (groupId, frame) => frames.push({ groupId, ...structuredClone(frame) }) },
   });
+  const engine = makeEngine();
+  const reloaded = [];
   const f = {
     repo, engine, frames, submissions, hooks, agents, bindings, warnings,
     calls: { pumps: [], idles: [], after: [] },
@@ -79,9 +82,18 @@ function fixture(t, options = {}) {
       return f.emit(job.sessionId, type, data);
     },
     emit(sessionId, type, data) {
+      return f.emitOn(engine, sessionId, type, data);
+    },
+    emitOn(instance, sessionId, type, data) {
       const session = agents.get(sessionId).session;
       const event = { seq: session.seq++, type, data };
-      session.events.push(event); engine.onSessionEvent(session, event); return event;
+      session.events.push(event); instance.onSessionEvent(session, event); return event;
+    },
+    /** Simulate a plugin reload: fresh Engine over the same persisted repository. */
+    reload() {
+      const next = makeEngine();
+      reloaded.push(next);
+      return next;
     },
     begin(job, turn = 1) {
       f.event(job, 'turn/start', { turn });
@@ -112,7 +124,11 @@ function fixture(t, options = {}) {
       engine.afterJobFinished = job => { f.calls.after.push(job.jobId); return afterJobFinished(job); };
     },
   };
-  t.after(async () => { await engine.dispose(); await f.flush(); });
+  t.after(async () => {
+    await engine.dispose();
+    for (const instance of reloaded) await instance.dispose();
+    await f.flush();
+  });
   return f;
 }
 
@@ -329,4 +345,46 @@ test('a tampered binding blocks a historical settlement write', async t => {
   assert.equal(message.status, 'pending');
   assert.equal(f.frames.filter(frame => frame.type === 'message.updated').length, 0);
   assert.ok(f.warnings.some(text => /dropped reply settlement/.test(text)));
+});
+
+test('an outbox turn replayed after reload is delivered once and deduplicated', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  f.emit('session-1', 'assistant/message', { turn: 7, message: { content: [{ type: 'text', text: 'OUTBOX RESULT' }] } });
+  f.emit('session-1', 'turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await f.flush();
+  const placeholder = f.repo.messagesOf('group').find(message => message.kind === 'native');
+  assert.equal(placeholder.status, 'done');
+  assert.equal(placeholder.conversationId, 'conv-1');
+  const count = f.repo.messages.size;
+
+  // Plugin reload: the in-memory historical/settled maps are gone, only the
+  // durable repository survives. The same receipt must not create new work.
+  const next = f.reload();
+  f.emitOn(next, 'session-1', 'turn/start', { turn: 7 });
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 7, message: { content: [{ type: 'text', text: 'OUTBOX RESULT' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await f.flush();
+  assert.equal(f.repo.messages.size, count, 'reload replay must not add a reply');
+  assert.equal(f.repo.getMessage(placeholder.messageId).text, 'OUTBOX RESULT');
+  assert.equal(f.repo.messagesOf('group').filter(message => message.kind === 'native').length, 1);
+
+  // A genuinely new receipt after reload still projects into the closed
+  // conversation, proving the projection works (not merely refusing).
+  f.emitOn(next, 'session-1', 'turn/start', { turn: 8 });
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 8, message: { content: [{ type: 'text', text: 'SECOND RESULT' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 8, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 2);
+  assert.equal(native.at(-1).conversationId, 'conv-1');
+  assert.equal(native.at(-1).text, 'SECOND RESULT');
+  assert.equal(native.at(-1).meta.lateDelivery, true);
+  const afterSecond = f.repo.messages.size;
+  f.emitOn(next, 'session-1', 'turn/start', { turn: 8 });
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 8, message: { content: [{ type: 'text', text: 'SECOND RESULT' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 8, reason: { kind: 'completed' } });
+  await f.flush();
+  assert.equal(f.repo.messages.size, afterSecond);
 });
