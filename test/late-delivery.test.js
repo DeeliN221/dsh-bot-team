@@ -388,3 +388,56 @@ test('an outbox turn replayed after reload is delivered once and deduplicated', 
   await f.flush();
   assert.equal(f.repo.messages.size, afterSecond);
 });
+
+test('a reload in the middle of an outbox turn reuses the pending reply', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  await f.flush();
+  const pending = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].status, 'pending');
+
+  const next = f.reload();
+  f.emitOn(next, 'session-1', 'turn/start', { turn: 7 });
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 7, message: { content: [{ type: 'text', text: 'RESUMED RESULT' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 1, 'a pending placeholder is reused across reload');
+  assert.equal(native[0].messageId, pending[0].messageId);
+  assert.equal(native[0].status, 'done');
+  assert.equal(native[0].text, 'RESUMED RESULT');
+});
+
+test('a new historical turn supersedes one that never settled', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  await f.flush();
+  f.emit('session-1', 'turn/start', { turn: 8 });
+  f.emit('session-1', 'assistant/message', { turn: 8, message: { content: [{ type: 'text', text: 'NEWER RESULT' }] } });
+  f.emit('session-1', 'turn/end', { turn: 8, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 2);
+  assert.equal(native[0].status, 'stopped');
+  assert.equal(native[0].text, '');
+  assert.equal(native[1].status, 'done');
+  assert.equal(native[1].text, 'NEWER RESULT');
+});
+
+test('an owned cancel still settles after the member record is gone', async t => {
+  const f = fixture(t);
+  const { job } = await f.post();
+  f.begin(job);
+  f.answer(job, 'PARTIAL');
+  // The binding survives the membership; the job persisted its botId at start.
+  f.repo.members.delete('member');
+  f.engine.abortJob(job, 'user');
+  await f.flush();
+  const message = f.repo.getMessage(job.placeholderId);
+  assert.equal(job.state, 'stopped');
+  assert.equal(message.status, 'stopped');
+  assert.equal(message.error, '已停止');
+});

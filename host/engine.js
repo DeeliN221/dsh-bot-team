@@ -641,6 +641,7 @@ export class Engine {
 
     const member = this.repo.getMember(job.membershipId);
     const bot = member ? this.repo.getBot(member.botId) : undefined;
+    if (bot) job.botId = bot.botId;
     if (!member || !bot) {
       this.finishJob(job, 'error', '成员或 Bot 已不存在');
       return;
@@ -949,7 +950,13 @@ export class Engine {
     if (event.type !== 'turn/start' || !executionTurn(event.data?.turn) || !executionSeq(event.seq)) return null;
     const turn = event.data.turn;
     const active = this.historicalBySession.get(session.id);
-    if (active) return !active.finished && active.turn === turn ? active : null;
+    if (active) {
+      if (active.turn === turn) return active.finished ? null : active;
+      // A later receipt supersedes an earlier one that never settled (for
+      // example the process stopped between its start and end).
+      if (!active.finished) this.finishJob(active, 'stopped', '上一条回报未结束，已由新回合接替');
+      else this.historicalBySession.delete(session.id);
+    }
     if (this.activeBySession.has(session.id)) return null;
     const binding = this.sessionBinding(session.id);
     if (!binding) return null;
@@ -957,10 +964,11 @@ export class Engine {
     // A binding pointing at the live conversation is the normal native path.
     if (!current || binding.conversationId === current) return null;
     if (this.settledTurns.get(session.id)?.has(turn)) return null;
-    const settled = (this.repo.messagesOf?.(binding.groupId) || []).some(message =>
-      message.status !== 'pending' && message.meta?.execution?.sessionId === session.id &&
-      message.meta.execution.turn === turn);
-    if (settled) return null;
+    const recorded = (this.repo.messagesOf?.(binding.groupId) || []).find(message =>
+      message.meta?.execution?.sessionId === session.id && message.meta.execution.turn === turn);
+    // A settled row means this receipt is a replay; a pending row means the
+    // host restarted mid-turn and the placeholder must be reused, not doubled.
+    if (recorded && recorded.status !== 'pending') return null;
     const bot = this.repo.getBot(binding.botId);
     if (!bot) return null;
     const jobId = newId('job');
@@ -979,16 +987,21 @@ export class Engine {
       done: Promise.resolve(),
     };
     try {
-      const placeholder = this.createMessage({
+      const placeholder = recorded ?? this.createMessage({
         groupId: job.groupId, conversationId: job.conversationId,
         author: { type: 'bot', botId: binding.botId, membershipId: binding.membershipId, name: bot.name },
         text: '', status: 'pending', kind: 'native',
         provider: bot.provider ?? null, model: bot.model ?? null, reasoningEffort: bot.reasoningEffort ?? null,
         meta: { nativeSession: true, historical: true, execution: job.execution },
       }, { binding });
+      if (recorded) {
+        recorded.meta = { ...(recorded.meta || {}), historical: true, execution: job.execution };
+        recorded.updatedAt = now();
+        this.repo.putMessage(recorded);
+      }
       job.placeholderId = placeholder.messageId;
       this.historicalBySession.set(session.id, job);
-      this.bus.emit(job.groupId, { type: 'message.added', message: placeholder });
+      if (!recorded) this.bus.emit(job.groupId, { type: 'message.added', message: placeholder });
       return job;
     } catch (error) {
       this.logger?.warn?.('bot-team: historical delivery adoption failed: ' + String(error?.message || error));
@@ -1045,8 +1058,14 @@ export class Engine {
     const live = this.ctx.agents.get(session.id);
     if (live?.session && live.session !== session) return;
     if (event.type === 'turn/end') this.discussionRunner.nativeSettled(session.id);
-    const job = this.activeBySession.get(session.id) || this.historicalBySession.get(session.id) ||
-      this.adoptNativeTurn(session, event) || this.adoptHistoricalTurn(session, event);
+    const historical = this.historicalBySession.get(session.id);
+    // A newer receipt must be able to supersede a historical turn that never
+    // settled; adoptHistoricalTurn settles the old one before creating the new.
+    const supersede = historical && event.type === 'turn/start'
+      && executionTurn(event.data?.turn) && event.data.turn !== historical.turn;
+    const job = this.activeBySession.get(session.id)
+      || (supersede ? (this.adoptHistoricalTurn(session, event) || historical) : historical)
+      || this.adoptNativeTurn(session, event) || this.adoptHistoricalTurn(session, event);
     if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job) && !this.isHistoricalJob(job))) return;
     if (job.ending) { job.following.push({ session, event }); return; }
     const data = event.data || {};
