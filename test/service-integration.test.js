@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { BotTeamService } from '../host/service.js';
+import { BotTeamService, PLUGIN_INFO } from '../host/service.js';
 import { offlineUpdateDependencies } from './update-check-fixture.js';
 import { resolveConfig } from '../host/util.js';
 import { loadClient, walk } from './client-harness.js';
@@ -247,11 +247,12 @@ test('the real service boots, registers its routes/tools, and drives direct chat
   );
   try {
     await service.ready;
-    assert.equal(routes.length, 14, 'bootstrap/update/messages/conversations/execution/session-history/session-export/events/action/health/file/upload/skills/export-pdf routes');
+    assert.equal(routes.length, 15, 'bootstrap/update/messages/conversations/execution/session-history/session-export/events/action/health/file/upload/attachment/skills/export-pdf routes');
     assert.deepEqual(
       routes.map((route) => route.path).sort(),
       [
         '/api/bot-team.action',
+        '/api/bot-team.attachment',
         '/api/bot-team.bootstrap',
         '/api/bot-team.conversations',
         '/api/bot-team.events',
@@ -286,9 +287,9 @@ test('the real service boots, registers its routes/tools, and drives direct chat
     assert.equal(boot.folders.length, 0);
     assert.equal(boot.groups.filter((group) => group.kind === 'direct').length, 1);
     assert.equal(boot.plugin.packageName, 'dsh-bot-team');
-    assert.equal(boot.plugin.version, '1.3.0');
+    assert.equal(boot.plugin.version, PLUGIN_INFO.version);
     assert.equal(boot.plugin.author, 'shper');
-    assert.equal(service.healthPayload().pluginVersion, '1.3.0');
+    assert.equal(service.healthPayload().pluginVersion, PLUGIN_INFO.version);
 
     const folder = await service.dispatch('folder.create', { title: '工作' });
     const group = await service.dispatch('group.create', { title: '集成群', folderId: folder.folderId });

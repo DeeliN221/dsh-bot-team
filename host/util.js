@@ -36,6 +36,14 @@ export function resolveConfig(raw = {}) {
     botSandbox: raw.botSandbox !== false,
     botApprovalPolicy: raw.botApprovalPolicy === 'never' ? 'never' : 'ask',
     autoDispatchReady: raw.autoDispatchReady === true,
+    // 'final' projects only the turn's final answer into the reply body; 'full'
+    // keeps the legacy accumulated step transcript.
+    resultMode: raw.resultMode === 'final' ? 'final' : 'full',
+    // Extra absolute roots whose files the native `present` tool may expose in
+    // the group timeline; the Bot working directory is always allowed.
+    deliveryRoots: Array.isArray(raw.deliveryRoots)
+      ? raw.deliveryRoots.filter(root => typeof root === 'string' && path.isAbsolute(root)).map(root => path.resolve(root))
+      : [],
     dailyTokenBudget: positiveInt(raw.dailyTokenBudget, 5000000, 1000, 100000000),
     toolWaitTimeoutMs: positiveInt(raw.toolWaitTimeoutMs, 180000, 10000, 900000),
     maxMembersPerGroup: positiveInt(raw.maxMembersPerGroup, 12, 1, 50),

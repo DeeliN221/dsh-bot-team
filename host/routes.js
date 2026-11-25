@@ -29,6 +29,7 @@ export const ROUTES = {
   health: '/api/bot-team.health',
   file: '/api/bot-team.file',
   upload: '/api/bot-team.upload',
+  attachment: '/api/bot-team.attachment',
   skills: '/api/bot-team.skills',
   exportPdf: '/api/bot-team.export.pdf',
 };
@@ -108,6 +109,12 @@ export function registerRoutes(ctx, service) {
     methods: ['POST'],
     requestBody: 'buffered',
     fetch: (request) => service.handleUploadHttp(request),
+  });
+  register({
+    path: ROUTES.attachment,
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: (request) => service.handleAttachmentHttp(request),
   });
   register({
     path: ROUTES.exportPdf,

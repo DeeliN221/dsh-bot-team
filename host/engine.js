@@ -22,6 +22,8 @@ import {
   buildTurnPrompt,
   parseReviewVerdict,
 } from './prompt.js';
+import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { newId, now, withTimeout } from './util.js';
 import { DiscussionRunner } from './discussion-runner.js';
 import { isDiscussionActive } from './discussion-flow.js';
@@ -31,6 +33,9 @@ import { currentConversationId, conversationFloor, conversationIdOf, isCurrentMe
 const executionSeq = (value) => Number.isSafeInteger(value) && value >= 0;
 const executionTurn = (value) => Number.isSafeInteger(value) && value > 0;
 const executionEvent = (type) => typeof type === 'string';
+/** `present` declares at most four files; reuse the upload cap for bytes. */
+const MAX_DELIVERABLE_FILES = 4;
+const MAX_DELIVERABLE_BYTES = 32 * 1024 * 1024;
 
 export class Engine {
   constructor({ ctx, repo, pool, personas, bus, config, logger, quotaGuard, taskHook, workspaceGuard, assertAdmission, discussionGuard }) {
@@ -110,6 +115,22 @@ export class Engine {
       return isCurrentMemberSession(this.repo, member, job.sessionId);
     }
     return true;
+  }
+
+  /**
+   * A submitted job whose conversation rotated but whose own native session is
+   * untouched may still deliver its result to the original placeholder. Any
+   * change of the member's session mapping, Agent disposal, or a still-current
+   * conversation keeps the legacy stale behavior.
+   */
+  isLateDelivery(job) {
+    if (!job || !job.submitted || this.isCurrentJob(job)) return false;
+    const current = currentConversationId(this.repo, job.groupId);
+    if (!current || current === job.conversationId) return false;
+    const member = this.repo.getMember(job.membershipId);
+    if (!member || member.groupId !== job.groupId) return false;
+    if (!job.sessionId || member.sessionId !== job.sessionId) return false;
+    return this.activeBySession.get(job.sessionId) === job;
   }
 
   assertJobCurrent(job) {
@@ -282,6 +303,60 @@ export class Engine {
     job.approvalMessages.delete(key);
   }
 
+  /**
+   * Attach files declared by the native `present` tool to the Bot reply.
+   *
+   * DSH appends `deliverables/presented` with source paths; the group timeline
+   * reuses the native attachment store (content-addressed, read-only) instead
+   * of inventing a second file channel. Files outside the Bot working directory
+   * (or configured delivery roots) are never exposed.
+   */
+  async projectDeliverables(job, data) {
+    const message = job.placeholderId ? this.repo.messages.get(job.placeholderId) : undefined;
+    const store = this.ctx.get?.('attachments');
+    if (!message || typeof store?.saveFile !== 'function' || !Array.isArray(data?.files)) return;
+    const agent = job.sessionId ? this.ctx.agents.get(job.sessionId) : undefined;
+    const cwd = agent?.session?.header?.cwd;
+    const roots = [cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]
+      .filter(root => typeof root === 'string' && path.isAbsolute(root))
+      .map(root => path.resolve(root));
+    if (roots.length === 0) return;
+    job.deliveredFiles = job.deliveredFiles || new Set();
+    for (const file of data.files) {
+      if (job.deliveredFiles.size >= MAX_DELIVERABLE_FILES) break;
+      if (!file || typeof file.path !== 'string' || file.path.length === 0) continue;
+      const target = path.resolve(cwd || roots[0], file.path);
+      if (!roots.some(root => target === root || target.startsWith(root + path.sep))) {
+        this.logger?.warn?.('bot-team: presented file outside the Bot workspace: ' + target);
+        continue;
+      }
+      if (job.deliveredFiles.has(target)) continue;
+      // Reserve before the first await so concurrent events cannot attach twice.
+      job.deliveredFiles.add(target);
+      try {
+        const info = await stat(target);
+        if (!info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
+          job.deliveredFiles.delete(target);
+          continue;
+        }
+        const ref = await store.saveFile({ data: new Uint8Array(await readFile(target)), name: path.basename(target) });
+        const current = this.repo.messages.get(job.placeholderId);
+        if (!current) continue;
+        if ((current.attachments || []).some(item => item?.attachmentId === ref.attachmentId)) continue;
+        const hostPath = store.fileHostPath?.(ref);
+        current.attachments = [...(current.attachments || []), {
+          attachmentId: ref.attachmentId, name: ref.name, bytes: ref.bytes, ...(hostPath ? { path: hostPath } : {}),
+        }];
+        current.updatedAt = now();
+        this.repo.putMessage(current);
+        this.bus.emit(job.groupId, { type: 'message.updated', message: current });
+      } catch (error) {
+        job.deliveredFiles.delete(target);
+        this.logger?.warn?.('bot-team: attach presented file failed: ' + String(error?.message || error));
+      }
+    }
+  }
+
   // ── public dispatch ──────────────────────────────────────────────────────
   assertQuota(groupId) {
     this.assertAdmission(groupId);
@@ -415,6 +490,10 @@ export class Engine {
     };
     job.steps = [];
     job.streamText = '';
+    job.stepCount = 0;
+    job.finalAnswerText = '';
+    job.lastAssistantText = '';
+    job.finalAnswerStep = null;
     job.requestMetrics = new LastRequestMetrics();
     job.finished = false;
     job.following = [];
@@ -581,7 +660,7 @@ export class Engine {
   }
 
   async persistExecution(job, patch, seq = null) {
-    this.assertJobCurrent(job);
+    if (!this.isCurrentJob(job) && !this.isLateDelivery(job)) this.assertJobCurrent(job);
     const message = this.repo.messages.get(job.placeholderId);
     if (!message) throw new Error('无法保存执行记录：回复消息不存在');
     job.execution = { ...job.execution, ...patch };
@@ -590,7 +669,7 @@ export class Engine {
     // Do not use putMessage here: it deliberately swallows storage failures.
     const saved = this.repo.putMessageStrict(message);
     await saved;
-    if (job.stepId) await this.discussionRunner.execution(job);
+    if (job.stepId && this.isCurrentJob(job)) await this.discussionRunner.execution(job);
     if (this.isCurrentJob(job)) this.emitExecutionUpdated(job, seq, true);
   }
 
@@ -734,6 +813,10 @@ export class Engine {
     job.observedTurnSeq = -1;
     job.steps = [];
     job.streamText = '';
+    job.stepCount = 0;
+    job.finalAnswerText = '';
+    job.lastAssistantText = '';
+    job.finalAnswerStep = null;
     job.streamAttemptId = null;
     job.usage = null;
     job.requestMetrics = new LastRequestMetrics();
@@ -769,12 +852,17 @@ export class Engine {
     if (live?.session && live.session !== session) return;
     if (event.type === 'turn/end') this.discussionRunner.nativeSettled(session.id);
     const job = this.activeBySession.get(session.id) || this.adoptNativeTurn(session, event);
-    if (!job || job.finished || !this.isCurrentJob(job)) return;
+    if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job))) return;
     if (job.ending) { job.following.push({ session, event }); return; }
     const data = event.data || {};
     if (job.awaitingContinuation) {
       if (event.type === 'turn/start') {
-        if (!this.startNativeContinuation(job, session, event)) return;
+        if (!this.startNativeContinuation(job, session, event)) {
+          // A rotated conversation cannot host the continuation: settle the
+          // completed turn on its original placeholder instead of leaking it.
+          if (this.isLateDelivery(job)) this.finishJob(job, 'done');
+          return;
+        }
       }
       else {
         if (event.type.startsWith('goal/')) queueMicrotask(() => this.checkNativeGoal(session.id, job));
@@ -832,6 +920,14 @@ export class Engine {
       return;
     }
     if (executionSeq(event.seq) && executionEvent(event.type)) this.emitExecutionUpdated(job, event.seq);
+    if (event.type === 'deliverables/presented' && data.turn === job.turn) {
+      // Reuse the native attachment store; never let a failed projection fail
+      // the turn or delay its settlement.
+      void this.projectDeliverables(job, data).catch((error) => {
+        this.logger?.warn?.('bot-team: project presented files failed: ' + String(error?.message || error));
+      });
+      return;
+    }
     if (event.type === 'approval/asked') {
       if (this.config.botApprovalPolicy !== 'never') this.approvalMessage(job, event.data || {});
       return;
@@ -844,10 +940,23 @@ export class Engine {
       job.requestMetrics?.settle(event, job.turn);
     }
     if (event.type === 'assistant/message' && event.data.turn === job.turn) {
-      const messageText = (event.data.message.content || [])
+      const content = event.data.message.content || [];
+      const messageText = content
         .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
         .map((block) => block.text)
         .join('');
+      // Only a final answer is a step whose content has text but no tool call:
+      // the agent loop ends the turn right after such a message.
+      if (this.config.resultMode === 'final') {
+        job.stepCount = (job.stepCount || 0) + 1;
+        if (messageText) job.lastAssistantText = messageText;
+        if (messageText && !content.some((block) => block && block.type === 'tool-call')) {
+          job.finalAnswerText = messageText;
+          job.finalAnswerStep = job.stepCount;
+        }
+        if (event.data.usage) job.usage = event.data.usage;
+        return;
+      }
       if (messageText) job.steps.push(messageText);
       if (event.data.usage) job.usage = event.data.usage;
       const combined = job.steps.filter(Boolean).join('\n\n');
@@ -866,10 +975,11 @@ export class Engine {
 
   finishTurn(job, reason = {}) {
     if (job.finished) return;
-    if (!this.isCurrentJob(job)) { this.finishJob(job, 'stopped', '本次执行所属会话已结束'); return; }
+    if (!this.isCurrentJob(job) && !this.isLateDelivery(job)) { this.finishJob(job, 'stopped', '本次执行所属会话已结束'); return; }
     job.ending = false;
     if (reason.kind === 'completed') {
-      if (this.nativeGoalPending(job.sessionId) || job.following?.some(item => item.event?.type === 'turn/start')) {
+      if (this.isCurrentJob(job) &&
+          (this.nativeGoalPending(job.sessionId) || job.following?.some(item => item.event?.type === 'turn/start'))) {
         this.settleMessage(job, 'done');
         job.awaitingContinuation = true;
         this.replayFollowing(job);
@@ -890,7 +1000,7 @@ export class Engine {
     if (!payload || !payload.agent || !payload.frame) return;
     if (this.ctx.agents.get(payload.agent.id) !== payload.agent) return;
     const job = this.activeBySession.get(payload.agent.id);
-    if (!job || job.finished || !this.isCurrentJob(job)) return;
+    if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job))) return;
     if (job.ending) { job.following.push({ stream: payload }); return; }
     if (job.awaitingContinuation || job.turn === null || job.observedTurn !== job.turn) return;
     const frame = payload.frame;
@@ -906,6 +1016,9 @@ export class Engine {
       job.requestMetrics?.end(frame);
       return;
     }
+    // Final mode never projects partial deltas into the reply body: the
+    // placeholder stays empty so the existing typing state keeps showing.
+    if (this.config.resultMode === 'final') return;
     if (
       frame.type === 'chunk' &&
       frame.chunk &&
@@ -969,8 +1082,20 @@ export class Engine {
     this.finishJob(job, 'stopped', reason);
   }
 
-  settleMessage(job, status, error) {
-    const text = ((job.steps || []).filter(Boolean).join('\n\n') || job.streamText || '').trim();
+  /** Reply body: the full step transcript, or only the turn's final answer. */
+  projectedText(job) {
+    if (this.config.resultMode !== 'final') {
+      return ((job.steps || []).filter(Boolean).join('\n\n') || job.streamText || '').trim();
+    }
+    const finalAnswer = typeof job.finalAnswerText === 'string' ? job.finalAnswerText.trim() : '';
+    if (finalAnswer) return finalAnswer;
+    // Stopped/error/max-tokens turns fall back to their last non-empty step text,
+    // including commentary that carried a tool call.
+    return typeof job.lastAssistantText === 'string' ? job.lastAssistantText.trim() : '';
+  }
+
+  settleMessage(job, status, error, options = {}) {
+    const text = this.projectedText(job);
     const message = job.placeholderId ? this.repo.messages.get(job.placeholderId) : undefined;
     if (message) {
       message.text = text;
@@ -980,7 +1105,11 @@ export class Engine {
       message.generationStats = job.requestMetrics?.finish(status) ?? null;
       message.kind = job.messageKind ?? message.kind ?? 'chat';
       const meta = { ...(message.meta || {}), ...(job.meta || {}), execution: job.execution,
-        ...(job.stepId ? { logicalJobComplete: job.finished === true } : {}) };
+        ...(job.stepId ? { logicalJobComplete: job.finished === true } : {}),
+        ...(options.late ? { lateDelivery: true } : {}),
+        ...(this.config.resultMode === 'final'
+          ? { resultProjection: { stepCount: job.stepCount || 0, finalAnswerStep: job.finalAnswerStep ?? null } }
+          : {}) };
       if (job.kind === 'review' && status === 'done') {
         const verdict = parseReviewVerdict(text);
         if (verdict) meta.verdict = verdict;
@@ -1008,10 +1137,11 @@ export class Engine {
     job.error = error || null;
     if (job.timer) clearTimeout(job.timer);
     const current = this.isCurrentJob(job);
+    const late = !current && this.isLateDelivery(job);
     if (job.sessionId && this.activeBySession.get(job.sessionId) === job) this.activeBySession.delete(job.sessionId);
     if (this.running.get(job.membershipId) === job) this.running.delete(job.membershipId);
 
-    const message = this.settleMessage(job, status, error);
+    const message = this.settleMessage(job, status, error, { late });
     if (job.approvalMessages && job.approvalMessages.size > 0) {
       for (const approvalId of [...job.approvalMessages.keys()]) {
         this.settleApproval(job, approvalId, 'cancelled');
@@ -1039,16 +1169,23 @@ export class Engine {
     if (job.stepId) {
       const pending = { groupId: job.groupId, conversationId: job.conversationId };
       this.pendingWork.add(pending);
-      void this.discussionRunner.finished(job).catch(failure => this.discussionRunner.failed(job.discussionId, failure))
+      // A late delivery belongs to a closed conversation: never advance its
+      // discussion or start the next step there.
+      const advanced = current
+        ? this.discussionRunner.finished(job).catch(failure => this.discussionRunner.failed(job.discussionId, failure))
+        : Promise.resolve();
+      void advanced
         .finally(() => {
           this.pendingWork.delete(pending); job.resolveDone?.();
-          this.pump(job.groupId); this.checkIdle(job.groupId);
+          if (current) { this.pump(job.groupId); this.checkIdle(job.groupId); }
         });
     } else {
       job.resolveDone?.();
-      this.pump(job.groupId);
-      if (current) this.afterJobFinished(job);
-      this.checkIdle(job.groupId);
+      if (current) {
+        this.pump(job.groupId);
+        this.afterJobFinished(job);
+        this.checkIdle(job.groupId);
+      }
     }
   }
 

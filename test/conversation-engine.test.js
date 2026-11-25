@@ -213,7 +213,9 @@ test('late native claim, stream, goal and durable end callbacks cannot advance t
   endWrite.resolve(); await f.flush();
   assert.equal(f.repo.messages.size, count); assert.equal(f.hooks.length, 0);
   assert.ok(!f.frames.slice(frameCount).some(frame => frame.type === 'member.status'));
-  assert.equal(job.state, 'stopped');
+  // The completed turn settles on its own conversation as a real late delivery.
+  assert.equal(job.state, 'done');
+  assert.equal(f.repo.getMessage(job.placeholderId).meta.lateDelivery, true);
 });
 
 test('native recovery and direct turn adoption ignore stale member mappings', async t => {

@@ -84,7 +84,7 @@ dsh plugin --profile <profile> add dsh-bot-team@1.3.0
 
 安装后同样要重新加载 Host 模块（disable→enable 或重启）。
 
-> `1.3.0` 是当前源码版本；npm 上的公开发行版需按 [发布指南](https://github.com/shper/dsh-bot-team/blob/main/docs/%E5%8F%91%E5%B8%83%E6%8C%87%E5%8D%97.md) 执行 `npm publish`。在发布前安装本机源码，请用本地目录路径。
+> `1.3.1` 是当前源码版本；npm 上的公开发行版需按 [发布指南](https://github.com/shper/dsh-bot-team/blob/main/docs/%E5%8F%91%E5%B8%83%E6%8C%87%E5%8D%97.md) 执行 `npm publish`。在发布前安装本机源码，请用本地目录路径。
 
 ### 从源码
 
@@ -220,6 +220,7 @@ npm pack --dry-run   # 查看真正会被发布的文件
 - [完整功能、HTTP 通道与配置](https://github.com/shper/dsh-bot-team/blob/main/docs/%E9%85%8D%E7%BD%AE%E4%B8%8E%E6%8E%A5%E5%8F%A3.md)
 - [使用指南](https://github.com/shper/dsh-bot-team/blob/main/docs/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97.md)
 - [讨论与辩论：流程、工具、API 与恢复边界](<https://github.com/shper/dsh-bot-team/blob/main/docs/%E8%AE%A8%E8%AE%BA%E4%B8%8E%E8%BE%A9%E8%AE%BA.md>)（1.3.0 源码版本）
+- [顾问身份、结果投影与文件交付](<https://github.com/shper/dsh-bot-team/blob/main/docs/advisor-identity.md>)（1.3.1 源码版本）
 - [发布指南](https://github.com/shper/dsh-bot-team/blob/main/docs/%E5%8F%91%E5%B8%83%E6%8C%87%E5%8D%97.md)
 - [升级检查清单](https://github.com/shper/dsh-bot-team/blob/main/docs/%E5%8D%87%E7%BA%A7%E6%A3%80%E6%9F%A5%E6%B8%85%E5%8D%95.md)
 - [消息执行过程](https://github.com/shper/dsh-bot-team/blob/main/docs/%E6%B6%88%E6%81%AF%E6%89%A7%E8%A1%8C%E8%BF%87%E7%A8%8B.md)

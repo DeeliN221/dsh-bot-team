@@ -7,6 +7,8 @@
  */
 import path from 'node:path';
 import { appendFile, mkdir, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 import { createRequire } from 'node:module';
 
 import { openRepository } from './domain.js';
@@ -882,6 +884,49 @@ export class BotTeamService {
           attachmentId: String(ref.attachmentId),
           name: String(ref.name || name),
           bytes: Number.isSafeInteger(ref.bytes) ? ref.bytes : data.byteLength,
+        },
+      });
+    });
+  }
+
+  /**
+   * Download one attachment that a group timeline already references. Bytes
+   * come from the native attachment store; only references published on a
+   * message of that group are exposed.
+   */
+  handleAttachmentHttp(request) {
+    return this.withReady(async () => {
+      const url = new URL(request.url);
+      const groupId = String(url.searchParams.get('groupId') || '');
+      const attachmentId = String(url.searchParams.get('attachmentId') || '');
+      const name = String(url.searchParams.get('name') || '');
+      const rawBytes = Number(url.searchParams.get('bytes'));
+      if (!groupId || !attachmentId || !name) return json(fail('invalid-input', '附件参数不完整'), 400);
+      if (!this.repo.getGroup(groupId)) return json(fail('not-found', `群 ${groupId} 不存在`), 404);
+      const bytes = Number.isSafeInteger(rawBytes) && rawBytes >= 0 ? rawBytes : undefined;
+      const published = this.repo.messagesOf(groupId).some(message => (message.attachments || []).some(attachment =>
+        attachment && attachment.attachmentId === attachmentId && attachment.name === name
+        && (bytes === undefined || attachment.bytes === bytes)));
+      if (!published) return json(fail('not-found', '附件不属于该群消息'), 404);
+      const store = this.attachmentStore();
+      if (!store) return json(fail('unavailable', '附件服务不可用'), 503);
+      let hostPath;
+      try {
+        hostPath = store.fileHostPath({ attachmentId, name, bytes: bytes ?? 0 });
+      } catch {
+        return json(fail('not-found', '附件不可用'), 404);
+      }
+      if (typeof hostPath !== 'string' || !hostPath) return json(fail('not-found', '附件不可用'), 404);
+      let info;
+      try { info = await stat(hostPath); } catch { return json(fail('not-found', '附件文件不存在'), 404); }
+      if (!info.isFile()) return json(fail('not-found', '附件文件不存在'), 404);
+      const filename = name.replace(/["\\\r\n]/g, '_').slice(0, 120) || 'attachment';
+      return new Response(Readable.toWeb(createReadStream(hostPath)), {
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': `attachment; filename="attachment"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+          'content-length': String(info.size),
+          'cache-control': 'no-store',
         },
       });
     });
