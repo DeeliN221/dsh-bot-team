@@ -152,6 +152,7 @@ window.__ModuleLoader__.load({
       action: '/api/bot-team.action',
       file: '/api/bot-team.file',
       upload: '/api/bot-team.upload',
+      attachment: '/api/bot-team.attachment',
       skills: '/api/bot-team.skills',
       exportPdf: '/api/bot-team.export.pdf',
     };
@@ -442,6 +443,63 @@ window.__ModuleLoader__.load({
         unit += 1;
       }
       return (amount >= 10 ? Math.round(amount) : amount.toFixed(1)) + ' ' + units[unit];
+    }
+
+    /**
+     * Accessible name for one message attachment; the download state decides
+     * whether the trailing fact reads as a link action or a read-only note.
+     * @param attachment - stored attachment reference ({ name, bytes }).
+     * @param downloadable - whether the chip links to the Host download route.
+     * @returns screen-reader label carrying name, size and the fact.
+     */
+    function attachmentLabel(attachment, downloadable = false) {
+      const name = attachment && attachment.name ? String(attachment.name) : uiT('附件');
+      return [name, formatFileSize(attachment && attachment.bytes), uiT(downloadable ? '下载附件' : '只读附件')]
+        .filter(Boolean)
+        .join(' · ');
+    }
+
+    /**
+     * Same-origin download URL for one stored message attachment. The Host
+     * streams the original bytes with `Content-Disposition: attachment`; no
+     * other browser-reachable source carries them.
+     * @param endpoint - attachment route path.
+     * @param params - owning group, stored reference and display facts.
+     * @returns the URL, or '' when the reference cannot be addressed.
+     */
+    function attachmentDownloadUrl(endpoint, params) {
+      if (typeof endpoint !== 'string' || !endpoint) return '';
+      const source = params || {};
+      const attachmentId = typeof source.attachmentId === 'string' ? source.attachmentId : '';
+      const groupId = typeof source.groupId === 'string' ? source.groupId : '';
+      if (!attachmentId || !groupId) return '';
+      const bytes = Number.isSafeInteger(source.bytes) && source.bytes >= 0 ? source.bytes : 0;
+      return `${endpoint}?groupId=${encodeURIComponent(groupId)}`
+        + `&attachmentId=${encodeURIComponent(attachmentId)}`
+        + `&name=${encodeURIComponent(String(source.name || 'attachment'))}`
+        + `&bytes=${encodeURIComponent(String(bytes))}`;
+    }
+
+    /**
+     * Save one attachment through the shell's file-action service, falling
+     * back to the anchor's own same-origin download when that service is
+     * absent or refuses.
+     * @param event - activating click/keyboard event.
+     * @param href - attachment download URL.
+     * @param name - original file name for the save dialog.
+     */
+    function saveAttachment(event, href, name) {
+      const actions = appCtx && typeof appCtx.get === 'function' ? appCtx.get('fileActions') : null;
+      if (!actions || typeof actions.save !== 'function') return; // <a download> handles it
+      if (event && typeof event.preventDefault === 'function') event.preventDefault();
+      const fallback = () => {
+        if (typeof window !== 'undefined' && window.location) window.location.assign(href);
+      };
+      try {
+        Promise.resolve(actions.save({ url: href, name }, 'download')).catch(fallback);
+      } catch {
+        fallback();
+      }
     }
 
     /** The / menu only opens on a whitespace-bounded token under the caret. */
@@ -1560,6 +1618,8 @@ window.__ModuleLoader__.load({
       "选填，显示在聊天消息的名字后面，最多 120 字。": "Optional; shown after the name in chat messages. Up to 120 characters.",
       "例如：领航员 / Navigator 🧭": "e.g. Navigator 🧭",
       "消息": "Message",
+      "消息附件": "Message attachments",
+      "下载附件": "Download attachment",
       "消息操作": "Message actions",
       "消息设置": "Message settings",
       "消息信息显示预览": "Message info display preview",
@@ -2098,6 +2158,134 @@ window.__ModuleLoader__.load({
       } catch {
         /* collapse still works for this session when storage is unavailable */
       }
+    }
+
+    // ── host shell navigation defaults ────────────────────────────────────
+    // The shell's central-panel selection is transient: a fresh page load starts
+    // on the Conversation, so Bot Team claims the daily landing itself and keeps
+    // the user's own last pick as the only veto. Nothing here writes Host state.
+    const HOST_PANEL_KEY = 'bot-team.host.panel';
+
+    function readHostPanelChoice() {
+      try {
+        const storage = typeof window !== 'undefined' ? window.localStorage : null;
+        const raw = storage ? storage.getItem(HOST_PANEL_KEY) : null;
+        return typeof raw === 'string' ? raw : '';
+      } catch {
+        return '';
+      }
+    }
+
+    function persistHostPanelChoice(panelId) {
+      try {
+        const storage = typeof window !== 'undefined' ? window.localStorage : null;
+        if (storage) storage.setItem(HOST_PANEL_KEY, typeof panelId === 'string' ? panelId : '');
+      } catch {
+        /* storage can be unavailable; the boot default still applies this session */
+      }
+    }
+
+    /**
+     * Central panel the plugin opens on a fresh page load. A remembered foreign
+     * panel is the user's explicit choice: leave the shell alone instead of
+     * reclaiming it. Only a panel that is no longer installed loses that veto.
+     * @param remembered - last explicitly selected panel id ('' = never picked).
+     * @param installed - main-slot keys currently registered by every plugin.
+     * @param pageKey - this plugin's page key.
+     * @returns the page key to select, or null to keep the shell's own default.
+     */
+    function bootPanelChoice(remembered, installed, pageKey) {
+      if (!Array.isArray(installed) || !installed.includes(pageKey)) return null;
+      if (remembered && remembered !== pageKey && installed.includes(remembered)) return null;
+      return pageKey;
+    }
+
+    // The shell auto-collapses its sidebar below this frame width (ui-layout's
+    // SIDEBAR_AUTO_COLLAPSE); the plugin never argues with the responsive default.
+    const HOST_SIDEBAR_AUTO_COLLAPSE = 1024;
+
+    const workspaceIdOf = (workspace) => (workspace && workspace.workspaceId) || '';
+
+    /**
+     * Project (Workspace) the central panel currently sits in, or null for the
+     * daily Bot Team page and for Sessions outside every registered project.
+     * @param list - Session list snapshot (`retainedBy.mainView` marks the shown Session).
+     * @param workspaces - Workspace snapshot with membership and paths.
+     * @returns the owning Workspace id as a string, or null.
+     */
+    function activeProjectId(list, workspaces) {
+      if (!list || !workspaces || !Array.isArray(workspaces.items)) return null;
+      const byId = list.byId && typeof list.byId === 'object' ? list.byId : {};
+      for (const id of Array.isArray(list.ids) ? list.ids : []) {
+        const summary = byId[id];
+        if (!summary || !summary.retainedBy || !(summary.retainedBy.mainView > 0)) continue;
+        const owner = workspaces.items.find((workspace) => Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(id))
+          || workspaces.items.find((workspace) => !!workspace.path && workspace.path === summary.cwd);
+        return owner ? String(workspaceIdOf(owner)) : null;
+      }
+      return null;
+    }
+
+    /**
+     * One host-shell decision for the Bot Team daily flow. Boot lands collapsed;
+     * entering a different project expands once; a manual collapse afterwards
+     * stands until the user enters another project.
+     * @param state - bootstrapped flag plus the project last entered.
+     * @param event - boot, panel change, or Session-selection change.
+     * @returns the next state and the sidebar action, or null for no action.
+     */
+    function nextHostNav(state, event) {
+      const current = state || { bootstrapped: false, projectId: null };
+      if (!event) return { state: current, action: null };
+      const narrow = event.narrow === true;
+      // Unknown shell state (no frame painted yet) never triggers an action.
+      const collapsed = typeof event.collapsed === 'boolean' ? event.collapsed : null;
+      if (event.kind === 'boot') {
+        if (current.bootstrapped || collapsed === null) return { state: current, action: null };
+        return {
+          state: { ...current, bootstrapped: true },
+          action: !narrow && !collapsed ? 'collapse' : null,
+        };
+      }
+      if (collapsed === null) return { state: current, action: null };
+      if (event.kind === 'selection') {
+        const projectId = typeof event.projectId === 'string' && event.projectId ? event.projectId : null;
+        const entered = projectId !== null && projectId !== current.projectId;
+        return {
+          state: { ...current, projectId },
+          action: current.bootstrapped && entered && !narrow && collapsed ? 'expand' : null,
+        };
+      }
+      if (event.kind === 'panel') {
+        // Returning to the daily page folds the tree the same way a fresh start does.
+        return {
+          state: current,
+          action: event.panelId === event.pageKey && !narrow && !collapsed ? 'collapse' : null,
+        };
+      }
+      return { state: current, action: null };
+    }
+
+    /** Bound state machine of {@link nextHostNav}: the environment lives in `host`. */
+    function createHostNavController(host) {
+      let state = { bootstrapped: false, projectId: null };
+      const dispatch = (event) => {
+        const decision = nextHostNav(state, event);
+        state = decision.state;
+        if (decision.action === 'collapse') host.collapse();
+        else if (decision.action === 'expand') host.expand();
+        return decision.action;
+      };
+      return {
+        state: () => state,
+        boot: () => dispatch({ kind: 'boot', collapsed: host.readCollapsed(), narrow: host.isNarrow() }),
+        panel: (panelId) => dispatch({
+          kind: 'panel', panelId, pageKey: host.pageKey, collapsed: host.readCollapsed(), narrow: host.isNarrow(),
+        }),
+        selection: (projectId) => dispatch({
+          kind: 'selection', projectId, collapsed: host.readCollapsed(), narrow: host.isNarrow(),
+        }),
+      };
     }
 
     const isDirectGroup = (group) => !!group && group.kind === 'direct';
@@ -4854,6 +5042,9 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
 .bt-library-group { display: inline-flex; align-items: center; flex: none; gap: 5px; min-width: 0; max-width: 150px; box-sizing: border-box; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--bt-accent-border); background: var(--bt-accent-soft); color: var(--bt-accent); font-size: 11px; line-height: 1.5; }
 .bt-library-group-more { flex: none; cursor: help; }
 .bt-library-group-more:focus-visible { outline: 2px solid var(--bt-accent); outline-offset: 2px; }
+.bt-attachment-link { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; gap: 8px; color: inherit; text-decoration: none; border-radius: 6px; }
+.bt-attachment-link:hover { background: var(--bt-accent-soft); }
+.bt-attachment-link:focus-visible { outline: 2px solid var(--bt-accent); outline-offset: 2px; }
 .bt-library-group svg { width: 13px; height: 13px; flex: none; }
 .bt-library-group span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bt-library-ungrouped { padding: 4px 0; color: var(--bt-text-3); font-size: 11px; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -8810,6 +9001,7 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
             ...rest,
             key: message.messageId,
             message,
+            groupId: group && group.groupId,
             historical: historicalMessage(message, group),
             groupStart: !canGroupMessages(previous, message),
             groupEnd: !canGroupMessages(message, next),
@@ -9170,6 +9362,7 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
 
     function renderMessageRow({
       message,
+      groupId,
       groupStart,
       groupEnd,
       historical = false,
@@ -9345,30 +9538,58 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
                 : null,
               messageAttachments.length > 0
                 ? h(
-                    'div',
-                    { style: S.messageAttachments },
-                    messageAttachments.map((attachment, index) =>
-                      h(
-                        'div',
-                        {
-                          key: attachment.attachmentId + ':' + attachment.name + ':' + index,
-                          style: S.messageAttachment(mine),
-                          title: attachment.path || attachment.name,
-                          rawTitle: true,
-                        },
-                        h(FileGlyph, { size: 15, style: { flex: '0 0 auto', opacity: 0.82 } }),
+                    'ul',
+                    {
+                      style: { ...S.messageAttachments, listStyle: 'none', margin: 0, padding: 0 },
+                      // A flex list keeps no native list semantics outside a nav in
+                      // Safari, so the explicit role restores them.
+                      role: 'list',
+                      'aria-label': uiT('消息附件'),
+                    },
+                    messageAttachments.map((attachment, index) => {
+                      const downloadUrl = attachmentDownloadUrl(ROUTES.attachment, {
+                        groupId,
+                        attachmentId: attachment.attachmentId,
+                        name: attachment.name,
+                        bytes: attachment.bytes,
+                      });
+                      const body = [
+                        h(FileGlyph, { key: 'glyph', size: 15, style: { flex: '0 0 auto', opacity: 0.82 } }),
                         h(
                           'span',
-                          { style: S.messageAttachmentBody },
+                          { key: 'body', style: S.messageAttachmentBody },
                           h('span', { style: S.messageAttachmentName, raw: true }, attachment.name),
                           h(
                             'span',
                             { style: S.messageAttachmentMeta },
-                            [formatFileSize(attachment.bytes), '只读附件'].filter(Boolean).join(' · '),
+                            [formatFileSize(attachment.bytes), downloadUrl ? uiT('下载附件') : uiT('只读附件')].filter(Boolean).join(' · '),
                           ),
                         ),
-                      ),
-                    ),
+                      ];
+                      const itemStyle = S.messageAttachment(mine);
+                      const itemKey = attachment.attachmentId + ':' + attachment.name + ':' + index;
+                      const itemTitle = attachment.path || attachment.name;
+                      if (!downloadUrl) {
+                        return h('li', { key: itemKey, style: itemStyle, title: itemTitle, rawTitle: true }, ...body);
+                      }
+                      return h(
+                        'li',
+                        { key: itemKey, style: itemStyle },
+                        h(
+                          'a',
+                          {
+                            className: 'bt-attachment-link',
+                            href: downloadUrl,
+                            download: attachment.name,
+                            title: itemTitle,
+                            rawTitle: true,
+                            'aria-label': attachmentLabel(attachment, true),
+                            onClick: (event) => saveAttachment(event, downloadUrl, attachment.name),
+                          },
+                          ...body,
+                        ),
+                      );
+                    }),
                   )
                 : null,
               showTyping
@@ -13542,6 +13763,149 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
       );
     }
 
+    // ── host shell wiring ─────────────────────────────────────────────────
+    /**
+     * Install the daily landing and the sidebar choreography on the running
+     * shell. Everything here is advisory: a missing shell API degrades to the
+     * stock host behaviour instead of failing the whole plugin.
+     * @param ctx - client root context.
+     * @returns disposer releasing every subscription it took.
+     */
+    /**
+     * Whether the migration config opts into the Bot Team daily landing. Only an
+     * explicit `config.defaultLanding === 'bot-team'` may move the shell's own
+     * default; anything else (including a missing config) keeps the native one.
+     * @param payload - bootstrap payload, or anything shaped like it.
+     * @returns true when the landing is explicitly enabled.
+     */
+    function landingEnabled(payload) {
+      const config = payload && typeof payload === 'object' ? payload.config : null;
+      return !!config && typeof config === 'object' && config.defaultLanding === 'bot-team';
+    }
+
+    /**
+     * Gate the daily landing on the migration config, then hand over to the
+     * shell wiring. The bootstrap read is the only network call; an unreadable
+     * or disabled config leaves the host shell completely untouched.
+     * @param ctx - client root context.
+     * @returns disposer releasing the wiring, if it ever started.
+     */
+    function installHostNavigation(ctx) {
+      const layout = ctx && ctx.layout;
+      if (!layout || typeof layout.selectPanel !== 'function'
+        || !ctx.slots || typeof ctx.slots.entries !== 'function') return () => {};
+      let disposeNavigation = null;
+      let disposed = false;
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      Promise.resolve()
+        .then(() => api.bootstrap(controller ? controller.signal : undefined))
+        .then((payload) => {
+          if (disposed || !landingEnabled(payload)) return;
+          disposeNavigation = startHostNavigation(ctx, layout);
+        })
+        .catch(() => { /* an unreadable bootstrap keeps the native default */ });
+      return () => {
+        disposed = true;
+        if (controller) controller.abort();
+        if (disposeNavigation) disposeNavigation();
+      };
+    }
+
+    /**
+     * The enabled form of {@link installHostNavigation}: boot landing, sidebar
+     * choreography, and memory of the user's own panel pick.
+     * @param ctx - client root context.
+     * @param layout - the shell's layout face (`ctx.layout`).
+     * @returns disposer releasing every subscription it took.
+     */
+    function startHostNavigation(ctx, layout) {
+      // Public API exposes the sidebar write (`toggleSidebar`) but not its
+      // folded state, so the frame's own rendered marker is the observation
+      // point: the shell overlay seat is always painted and the frame element
+      // is its parent.
+      const readCollapsed = () => {
+        if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return null;
+        const shell = document.querySelector('[data-shell-overlay]');
+        const frame = shell && shell.parentElement;
+        if (!frame || typeof frame.hasAttribute !== 'function') return null;
+        return frame.hasAttribute('data-sidebar-collapsed');
+      };
+      const host = {
+        pageKey: PAGE_KEY,
+        isNarrow: () => typeof window === 'undefined' || !(window.innerWidth >= HOST_SIDEBAR_AUTO_COLLAPSE),
+        readCollapsed,
+        collapse: () => { if (readCollapsed() !== true) layout.toggleSidebar(); },
+        expand: () => { if (readCollapsed() === true) layout.toggleSidebar(); },
+      };
+      const navigation = createHostNavController(host);
+      const installedPanels = () => ctx.slots.entries('main').flatMap((entry) => {
+        const key = entry && entry.options ? entry.options.key : undefined;
+        return typeof key === 'string' ? [key] : [];
+      });
+      // The host restores or creates the main Session asynchronously and the
+      // slot registration lands on its own schedule, so the default is retried
+      // for a short window instead of assuming either order.
+      let tries = 0;
+      let ownPanelPending = null;
+      const settle = () => {
+        const choice = bootPanelChoice(readHostPanelChoice(), installedPanels(), PAGE_KEY);
+        if (choice === null) {
+          if (!installedPanels().includes(PAGE_KEY) && tries++ < 40 && typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(settle);
+          }
+          return;
+        }
+        if (ownPanelPending === null) ownPanelPending = choice;
+        try {
+          layout.selectPanel(choice);
+        } catch {
+          // The panel is not ready yet; drop the bookkeeping and try next frame.
+          ownPanelPending = null;
+          if (tries++ < 40 && typeof requestAnimationFrame === 'function') requestAnimationFrame(settle);
+          return;
+        }
+        navigation.boot();
+      };
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(settle); else settle();
+
+      const unsubscribePanel = layout.panelInfo && typeof layout.panelInfo.subscribe === 'function'
+        ? layout.panelInfo.subscribe(() => {
+            const panelId = layout.panelInfo.getSnapshot().activePanelId;
+            if (ownPanelPending !== null) {
+              const own = ownPanelPending;
+              ownPanelPending = null;
+              if (panelId === own) return; // our own boot default, not a user pick
+            }
+            persistHostPanelChoice(typeof panelId === 'string' ? panelId : '');
+            if (navigation.state().bootstrapped) navigation.panel(typeof panelId === 'string' ? panelId : null);
+          })
+        : null;
+
+      // The boot selection may already have landed before this subscription
+      // (a synchronous renderer): settle it so the first user pick is never
+      // mistaken for our own.
+      if (ownPanelPending !== null && layout.panelInfo && layout.panelInfo.getSnapshot().activePanelId === ownPanelPending) {
+        ownPanelPending = null;
+      }
+      const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : null;
+      const workspaces = typeof ctx.get === 'function' ? ctx.get('workspaces') : null;
+      const syncSelection = () => {
+        if (!navigation.state().bootstrapped) return;
+        const list = sessions && sessions.list ? sessions.list.getSnapshot() : null;
+        const snapshot = workspaces && workspaces.list ? workspaces.list.getSnapshot() : null;
+        navigation.selection(activeProjectId(list, snapshot));
+      };
+      const unsubscribeSessions = sessions && sessions.list && typeof sessions.list.subscribe === 'function'
+        ? sessions.list.subscribe(syncSelection) : null;
+      const unsubscribeWorkspaces = workspaces && workspaces.list && typeof workspaces.list.subscribe === 'function'
+        ? workspaces.list.subscribe(syncSelection) : null;
+      return () => {
+        if (unsubscribePanel) unsubscribePanel();
+        if (unsubscribeSessions) unsubscribeSessions();
+        if (unsubscribeWorkspaces) unsubscribeWorkspaces();
+      };
+    }
+
     // ── sidebar icon ──────────────────────────────────────────────────────
     function PanelIcon(props) {
       const size = (props && props.size) || 18;
@@ -13568,6 +13932,7 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
         ctx.slots.inject('sidebar.panellist', () =>
           ctx.slots.register({ name: 'sidebar.panellist', id: PAGE_KEY, order: 40, label: 'Bot Team' }, PanelIcon),
         );
+        ctx.effect(() => installHostNavigation(ctx), 'bot-team: host navigation defaults');
       },
     };
   },
