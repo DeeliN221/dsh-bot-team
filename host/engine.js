@@ -22,7 +22,8 @@ import {
   buildTurnPrompt,
   parseReviewVerdict,
 } from './prompt.js';
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { newId, now, withTimeout } from './util.js';
 import { DiscussionRunner } from './discussion-runner.js';
@@ -69,7 +70,7 @@ function stepPhases(message) {
       return;
     }
     for (const [key, item] of Object.entries(value)) {
-      if (key === 'textSignature' || key === 'signature') {
+      if (key === 'textSignature') {
         const phase = signaturePhaseOf(item);
         if (phase) phases.push(phase);
       } else visit(item);
@@ -429,8 +430,8 @@ export class Engine {
     // workspace; without it, presented files would be dropped silently.
     const group = this.repo.getGroup(job.groupId);
     const cwd = agent?.session?.header?.cwd
-      ?? group?.projectWorkspaceCwd
       ?? group?.workspaceCwd
+      ?? group?.projectWorkspaceCwd
       ?? this.config.defaultCwd;
     const roots = [];
     for (const candidate of [cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]) {
@@ -449,20 +450,32 @@ export class Engine {
       // Reserve before the first await so concurrent events cannot attach twice.
       job.deliveredFiles.add(target);
       try {
-        // Follow symlinks only after confirming the real target stays inside an
-        // allowed root, so a link cannot expose an arbitrary host file.
+        // Resolve the path, then open the exact inode with O_NOFOLLOW and read
+        // from that handle: a symlink or size swap between checks cannot leak a
+        // different file than the one verified here.
         const resolved = await realpath(target);
-        const info = await lstat(target);
-        if (info.isSymbolicLink() || !info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
-          job.deliveredFiles.delete(target);
-          continue;
-        }
         if (!roots.some(root => resolved === root || resolved.startsWith(root + path.sep))) {
           job.deliveredFiles.delete(target);
           this.logger?.warn?.('bot-team: presented file resolves outside the Bot workspace: ' + resolved);
           continue;
         }
-        const ref = await store.saveFile({ data: new Uint8Array(await readFile(resolved)), name: path.basename(target) });
+        const handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+        let bytes;
+        try {
+          const info = await handle.stat();
+          if (!info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
+            job.deliveredFiles.delete(target);
+            continue;
+          }
+          bytes = await handle.readFile();
+        } finally {
+          await handle.close();
+        }
+        if (bytes.byteLength <= 0 || bytes.byteLength > MAX_DELIVERABLE_BYTES) {
+          job.deliveredFiles.delete(target);
+          continue;
+        }
+        const ref = await store.saveFile({ data: new Uint8Array(bytes), name: path.basename(target) });
         const current = this.repo.messages.get(job.placeholderId);
         if (!current) continue;
         if ((current.attachments || []).some(item => item?.attachmentId === ref.attachmentId)) continue;
@@ -1138,8 +1151,11 @@ export class Engine {
         // printed as final may be published, while a turn whose steps carry
         // non-final phases never projects commentary as its result.
         const phases = stepPhases(event.data.message);
-        const provenFinal = phases.includes('final_answer') ||
-          (phases.length === 0 && !content.some((block) => block && block.type === 'tool-call'));
+        const hasToolCall = content.some((block) => block && block.type === 'tool-call');
+        // A final answer never carries a tool call. With recorded phases, every
+        // phase on the message must be final_answer: a mixed message could hide
+        // commentary text in the same blocks, so it is not published.
+        const provenFinal = !hasToolCall && (phases.length === 0 || phases.every(phase => phase === 'final_answer'));
         if (messageText && provenFinal) {
           job.finalAnswerText = messageText;
           job.finalAnswerStep = job.stepCount;

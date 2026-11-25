@@ -47,7 +47,7 @@ resultMode: final   # full（默认）| final
 
 - `final`：群聊中的 Bot 回复只保留最终答案。最终答案取本 turn 最后一条 text 非空、且 `content` 不含 `tool-call` 块的 `assistant/message`，与宿主原生「最终回复」判定一致；流式增量不写入正文，pending/typing 状态保留。
 - 无已证实最终答案（停止、报错、达到输出上限）时正文留空，只保留既有 `status`/`error` 与审批等必要状态；绝不把内部 commentary 当结果发布。
-- 有真实阶段标记时以标记为准：assistant 消息 `source.replayState` 中 text 块 `textSignature` JSON 的 `phase` 为 `final_answer` 才接受；存在 phase 但不是 `final_answer` 时即使纯文本也不发布；完全无 phase 时才回退原生「text 非空且无 tool-call」判定。
+- 有真实阶段标记时以标记为准：assistant 消息 `source.replayState` 中 text 块 `textSignature` JSON 的 `phase` 必须全部为 `final_answer` 才接受；混有其它 phase 时整条消息不发布；完全无 phase 时才回退原生「text 非空且无 tool-call」判定。带 tool-call 的消息永不作为最终答案。
 - 审批卡、系统消息、讨论、任务、评审等既有消息类型不受影响；评审结论仍从最终答案解析。
 - `full`：维持 1.3.0 行为，全部 assistant 文本串接。
 

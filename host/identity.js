@@ -29,6 +29,8 @@ export const IDENTITY_SERVICE_NAME = 'botTeamIdentity';
 
 /** Bound ancestry walks; a deeper chain is not a Bot session. */
 const MAX_ANCESTRY = 8;
+/** Bound the verified-lineage cache so long-running hosts do not grow forever. */
+const MAX_LINEAGE = 512;
 
 const freeze = value => Object.freeze(value);
 
