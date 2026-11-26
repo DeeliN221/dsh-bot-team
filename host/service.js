@@ -155,6 +155,8 @@ export class BotTeamService {
     this.routeDispose = registerRoutes(ctx, this);
     this.toolDispose = null;
     this.disposed = false;
+    this.isReady = false;
+    this.onBeforeReady = null;
 
     this.ready = this.init();
     // Update detection is independent of chat startup and never delays ready.
@@ -233,6 +235,11 @@ export class BotTeamService {
       isBusy: sessionId => this.engine.activeBySession.has(sessionId),
     });
     await this.visibility.ready;
+    if (typeof this.onBeforeReady === 'function') {
+      try { await this.onBeforeReady(); }
+      catch (error) { this.logger?.warn?.('bot-team: identity lineage warmup failed: ' + String(error?.message || error)); }
+    }
+    if (!this.disposed) this.isReady = true;
     this.logger?.info?.(`bot-team: ready (domain bot_team, bots=${this.repo.bots.size}, groups=${this.repo.groups.size})`);
 
     if (this.config.smokeTest) {
@@ -917,9 +924,48 @@ export class BotTeamService {
       if (!published) return json(fail('not-found', '附件不属于该群消息'), 404);
       const store = this.attachmentStore();
       if (!store) return json(fail('unavailable', '附件服务不可用'), 503);
+      const filename = name.replace(/["\\\r\n]/g, '_').slice(0, 120) || 'attachment';
+      const baseHeaders = {
+        'content-type': 'application/octet-stream',
+        'content-disposition': `attachment; filename="attachment"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'cache-control': 'no-store',
+      };
+      // Prefer the verified SDK stream (works for non-host-file backends and
+      // validates length/digest), falling back to hostPath for minimal doubles.
+      if (typeof store.readFileStream === 'function') {
+        try {
+          const ref = { attachmentId, name, bytes: published.bytes };
+          const iterable = store.readFileStream(ref, request.signal);
+          const iterator = iterable[Symbol.asyncIterator]();
+          const first = await iterator.next();
+          const stream = new ReadableStream({
+            start(controller) {
+              if (!first.done) controller.enqueue(first.value);
+              else controller.close();
+            },
+            async pull(controller) {
+              try {
+                const step = await iterator.next();
+                if (step.done) controller.close();
+                else controller.enqueue(step.value);
+              } catch (err) { controller.error(err); }
+            },
+            async cancel() { try { await iterator.return?.(); } catch { /* noop */ } },
+          });
+          return new Response(stream, {
+            headers: {
+              ...baseHeaders,
+              ...(Number.isSafeInteger(published.bytes) && published.bytes >= 0
+                ? { 'content-length': String(published.bytes) } : {}),
+            },
+          });
+        } catch {
+          return json(fail('not-found', '附件不可用'), 404);
+        }
+      }
       let hostPath;
       try {
-        hostPath = store.fileHostPath({ attachmentId, name, bytes: published.bytes });
+        hostPath = store.fileHostPath?.({ attachmentId, name, bytes: published.bytes });
       } catch {
         return json(fail('not-found', '附件不可用'), 404);
       }
@@ -927,13 +973,10 @@ export class BotTeamService {
       let info;
       try { info = await stat(hostPath); } catch { return json(fail('not-found', '附件文件不存在'), 404); }
       if (!info.isFile()) return json(fail('not-found', '附件文件不存在'), 404);
-      const filename = name.replace(/["\\\r\n]/g, '_').slice(0, 120) || 'attachment';
       return new Response(Readable.toWeb(createReadStream(hostPath)), {
         headers: {
-          'content-type': 'application/octet-stream',
-          'content-disposition': `attachment; filename="attachment"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+          ...baseHeaders,
           'content-length': String(info.size),
-          'cache-control': 'no-store',
         },
       });
     });
@@ -3220,6 +3263,7 @@ export class BotTeamService {
   async dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.isReady = false;
     this.updateChecker?.dispose();
     try {
       await this.routeDispose?.();

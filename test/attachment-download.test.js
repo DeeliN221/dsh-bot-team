@@ -66,3 +66,28 @@ test('requires the full attachment identity', async t => {
   const response = await call(serviceWith({ root: os.tmpdir() }), { groupId: 'group' });
   assert.equal(response.status, 400);
 });
+
+test('prefers readFileStream when the attachment store supports it', async () => {
+  const messages = [{ messageId: 'm1', attachments: [{ attachmentId: 'att-stream', name: 'stream.txt', bytes: 11 }] }];
+  const service = {
+    withReady: run => run(),
+    repo: {
+      getGroup: id => (id === 'group' ? { groupId: 'group' } : undefined),
+      messagesOf: id => (id === 'group' ? messages : []),
+    },
+    attachmentStore: () => ({
+      async *readFileStream(ref) {
+        assert.equal(ref.attachmentId, 'att-stream');
+        yield new TextEncoder().encode('hello ');
+        yield new TextEncoder().encode('world');
+      },
+      fileHostPath: () => undefined,
+    }),
+  };
+  const response = await call(service, {
+    groupId: 'group', attachmentId: 'att-stream', name: 'stream.txt', bytes: '11',
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-length'), '11');
+  assert.equal(await response.text(), 'hello world');
+});

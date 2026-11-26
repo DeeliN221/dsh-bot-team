@@ -38,6 +38,28 @@ const executionEvent = (type) => typeof type === 'string';
 /** `present` declares at most four files; reuse the upload cap for bytes. */
 const MAX_DELIVERABLE_FILES = 4;
 const MAX_DELIVERABLE_BYTES = 32 * 1024 * 1024;
+const DELIVERABLE_READ_CHUNK = 64 * 1024;
+
+/**
+ * Read at most `maxBytes` from an already-opened handle so a file growing
+ * after `stat()` can never exhaust host memory.
+ */
+async function readFileBounded(handle, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const remaining = (maxBytes + 1) - total;
+    const buf = Buffer.allocUnsafe(Math.min(DELIVERABLE_READ_CHUNK, remaining));
+    const { bytesRead } = await handle.read(buf, 0, buf.length, null);
+    if (bytesRead <= 0) break;
+    total += bytesRead;
+    if (total > maxBytes) {
+      throw Object.assign(new Error(`presented file exceeds ${maxBytes} bytes`), { code: 'file-too-large' });
+    }
+    chunks.push(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead));
+  }
+  return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total);
+}
 
 /** A step phase recorded in a Codex signature string, or null for opaque data. */
 function signaturePhaseOf(value) {
@@ -103,6 +125,7 @@ export class Engine {
     this.activeBySession = new Map(); // sessionId -> job
     this.historicalBySession = new Map(); // sessionId -> closed-conversation job
     this.settledTurns = new Map(); // sessionId -> Set<turn> already settled
+    this.messageWriteQueues = new Map(); // messageId -> Promise serialization chain
     this.waiters = new Map(); // groupId -> [{ resolve }]
     this.discussionWaiters = new Map(); // discussionId -> [{ resolve }]
     this.disposed = false;
@@ -421,42 +444,173 @@ export class Engine {
    * of inventing a second file channel. Files outside the Bot working directory
    * (or configured delivery roots) are never exposed.
    */
-  async projectDeliverables(job, data) {
-    const message = job.placeholderId ? this.repo.messages.get(job.placeholderId) : undefined;
-    const store = this.ctx.get?.('attachments');
-    if (!message || typeof store?.saveFile !== 'function' || !Array.isArray(data?.files)) return;
-    const agent = job.sessionId ? this.ctx.agents.get(job.sessionId) : undefined;
-    // A released Agent (exactly the rotation/restart case) still owns a group
-    // workspace; without it, presented files would be dropped silently.
+  serializeMessageWrite(messageId, fn) {
+    const prev = this.messageWriteQueues.get(messageId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const cleanup = () => { if (this.messageWriteQueues.get(messageId) === next) this.messageWriteQueues.delete(messageId); };
+    next.then(cleanup, cleanup);
+    this.messageWriteQueues.set(messageId, next);
+    return next;
+  }
+
+  async persistMessageStrict(message) {
+    if (typeof this.repo.putMessageStrict === 'function') await this.repo.putMessageStrict(message);
+    else await Promise.resolve(this.repo.putMessage(message));
+  }
+
+  async recordDeliverableOutcome(job, target, outcome) {
+    return this.serializeMessageWrite(target.messageId, async () => {
+      const current = this.repo.messages.get(target.messageId);
+      if (!current || !this.canSettleMessage(job, current)) return false;
+      const existingMeta = current.meta && typeof current.meta === 'object' ? current.meta : {};
+      const existingDeliverables = existingMeta.deliverables && typeof existingMeta.deliverables === 'object'
+        ? existingMeta.deliverables : {};
+      const processedKeys = Array.isArray(existingDeliverables.processedKeys)
+        ? [...existingDeliverables.processedKeys] : [];
+      const failures = Array.isArray(existingMeta.deliverableFailures)
+        ? [...existingMeta.deliverableFailures] : [];
+
+      if (outcome.dedupeKey && processedKeys.includes(outcome.dedupeKey)) return false;
+
+      if (outcome.attachment) {
+        if ((current.attachments || []).length >= MAX_DELIVERABLE_FILES) return false;
+        if ((current.attachments || []).some(item => item?.attachmentId === outcome.attachment.attachmentId)) {
+          if (outcome.dedupeKey && !processedKeys.includes(outcome.dedupeKey)) {
+            processedKeys.push(outcome.dedupeKey);
+            current.meta = { ...existingMeta, deliverables: { ...existingDeliverables, processedKeys } };
+            current.updatedAt = now();
+            await this.persistMessageStrict(current);
+          }
+          return false;
+        }
+        current.attachments = [...(current.attachments || []), outcome.attachment];
+        if (outcome.dedupeKey) processedKeys.push(outcome.dedupeKey);
+        current.meta = { ...existingMeta, deliverables: { ...existingDeliverables, processedKeys } };
+      } else if (outcome.failure) {
+        if (outcome.dedupeKey) processedKeys.push(outcome.dedupeKey);
+        failures.push(outcome.failure);
+        current.meta = {
+          ...existingMeta,
+          deliverables: { ...existingDeliverables, processedKeys },
+          deliverableFailures: failures.slice(-16),
+        };
+      }
+      current.updatedAt = now();
+      await this.persistMessageStrict(current);
+      this.bus.emit(target.groupId, { type: 'message.updated', message: current });
+      return Boolean(outcome.attachment);
+    });
+  }
+
+  captureDeliverableTarget(job, session, event) {
+    const data = event?.data || {};
+    const sessionId = job.sessionId || session?.id || null;
+    const agent = sessionId ? this.ctx.agents.get?.(sessionId) : undefined;
     const group = this.repo.getGroup(job.groupId);
-    const cwd = agent?.session?.header?.cwd
+    const cwd = session?.header?.cwd
+      ?? agent?.session?.header?.cwd
       ?? group?.workspaceCwd
       ?? group?.projectWorkspaceCwd
       ?? this.config.defaultCwd;
+    return {
+      messageId: job.placeholderId,
+      groupId: job.groupId,
+      conversationId: job.conversationId,
+      sessionId,
+      turn: executionTurn(data.turn) ? data.turn : job.turn,
+      callId: typeof data.callId === 'string' && data.callId.length > 0
+        ? data.callId
+        : `seq-${executionSeq(event?.seq) ? event.seq : 'none'}`,
+      eventSeq: executionSeq(event?.seq) ? event.seq : null,
+      cwd,
+    };
+  }
+
+  enqueueDeliverables(job, session, event) {
+    const data = event?.data || {};
+    if (!Array.isArray(data.files) || data.files.length === 0 || !job.placeholderId) return;
+    const target = this.captureDeliverableTarget(job, session, event);
+    job.deliverablePromises = job.deliverablePromises || new Set();
+    const pendingOp = { groupId: target.groupId, conversationId: target.conversationId };
+    this.pendingWork.add(pendingOp);
+    const promise = this.projectDeliverables(job, data, target)
+      .catch((error) => {
+        this.logger?.warn?.('bot-team: project presented files failed: ' + String(error?.message || error));
+      })
+      .finally(() => {
+        job.deliverablePromises?.delete(promise);
+        this.pendingWork.delete(pendingOp);
+      });
+    job.deliverablePromises.add(promise);
+  }
+
+  async projectDeliverables(job, data, capturedTarget) {
+    const target = capturedTarget || {
+      messageId: job.placeholderId,
+      groupId: job.groupId,
+      conversationId: job.conversationId,
+      sessionId: job.sessionId,
+      turn: executionTurn(data?.turn) ? data.turn : job.turn,
+      callId: typeof data?.callId === 'string' && data.callId ? data.callId : 'default',
+      eventSeq: null,
+      cwd: this.ctx.agents.get?.(job.sessionId)?.session?.header?.cwd
+        ?? this.repo.getGroup(job.groupId)?.workspaceCwd
+        ?? this.repo.getGroup(job.groupId)?.projectWorkspaceCwd
+        ?? this.config.defaultCwd,
+    };
+    const initialMessage = target.messageId ? this.repo.messages.get(target.messageId) : undefined;
+    const store = this.ctx.get?.('attachments');
+    if (!initialMessage || !this.canSettleMessage(job, initialMessage) || !Array.isArray(data?.files)) return;
+    if (typeof store?.saveFile !== 'function') {
+      this.logger?.warn?.('bot-team: attachment store unavailable for presented deliverables');
+      return;
+    }
     const roots = [];
-    for (const candidate of [cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]) {
+    for (const candidate of [target.cwd, ...(Array.isArray(this.config.deliveryRoots) ? this.config.deliveryRoots : [])]) {
       if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) continue;
       const resolvedRoot = path.resolve(candidate);
       try { roots.push(await realpath(resolvedRoot)); }
       catch { roots.push(resolvedRoot); }
     }
     if (roots.length === 0) return;
-    job.deliveredFiles = job.deliveredFiles || new Set();
-    for (const file of data.files) {
-      if (job.deliveredFiles.size >= MAX_DELIVERABLE_FILES) break;
-      if (!file || typeof file.path !== 'string' || file.path.length === 0) continue;
-      const target = path.resolve(cwd || roots[0], file.path);
-      if (job.deliveredFiles.has(target)) continue;
-      // Reserve before the first await so concurrent events cannot attach twice.
-      job.deliveredFiles.add(target);
+
+    job.deliveredKeys = job.deliveredKeys || new Set();
+    const recordFailure = async (rawPath, reason, dedupeKey) => {
       try {
-        // Resolve the path, then open the exact inode with O_NOFOLLOW and read
-        // from that handle: a symlink or size swap between checks cannot leak a
-        // different file than the one verified here.
-        const resolved = await realpath(target);
+        await this.recordDeliverableOutcome(job, target, {
+          dedupeKey,
+          failure: {
+            path: rawPath,
+            name: path.basename(rawPath),
+            callId: target.callId,
+            turn: target.turn,
+            reason,
+          },
+        });
+      } catch (persistErr) {
+        this.logger?.warn?.('bot-team: persist deliverable failure failed: ' + String(persistErr?.message || persistErr));
+      }
+    };
+
+    for (const file of data.files) {
+      const currentCheck = this.repo.messages.get(target.messageId);
+      if (!currentCheck || !this.canSettleMessage(job, currentCheck)) break;
+      if ((currentCheck.attachments || []).length >= MAX_DELIVERABLE_FILES) break;
+      if (!file || typeof file.path !== 'string' || file.path.length === 0) continue;
+      const targetPath = path.resolve(target.cwd || roots[0], file.path);
+      const dedupeKey = `${target.sessionId || ''}|${target.turn ?? ''}|${target.callId}|${targetPath}`;
+      const persistedKeys = currentCheck.meta?.deliverables?.processedKeys;
+      if (job.deliveredKeys.has(dedupeKey) || (Array.isArray(persistedKeys) && persistedKeys.includes(dedupeKey))) {
+        continue;
+      }
+      // Reserve synchronously before the first await so duplicate events for
+      // the exact same (session, turn, callId, path) cannot race.
+      job.deliveredKeys.add(dedupeKey);
+      try {
+        const resolved = await realpath(targetPath);
         if (!roots.some(root => resolved === root || resolved.startsWith(root + path.sep))) {
-          job.deliveredFiles.delete(target);
           this.logger?.warn?.('bot-team: presented file resolves outside the Bot workspace: ' + resolved);
+          await recordFailure(file.path, 'outside-workspace', dedupeKey);
           continue;
         }
         const handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -464,35 +618,34 @@ export class Engine {
         try {
           const info = await handle.stat();
           if (!info.isFile() || info.size <= 0 || info.size > MAX_DELIVERABLE_BYTES) {
-            job.deliveredFiles.delete(target);
+            await recordFailure(file.path, !info.isFile() ? 'not-a-file' : info.size <= 0 ? 'empty-file' : 'file-too-large', dedupeKey);
             continue;
           }
-          bytes = await handle.readFile();
+          bytes = await readFileBounded(handle, MAX_DELIVERABLE_BYTES);
         } finally {
           await handle.close();
         }
         if (bytes.byteLength <= 0 || bytes.byteLength > MAX_DELIVERABLE_BYTES) {
-          job.deliveredFiles.delete(target);
+          await recordFailure(file.path, bytes.byteLength <= 0 ? 'empty-file' : 'file-too-large', dedupeKey);
           continue;
         }
-        const ref = await store.saveFile({ data: new Uint8Array(bytes), name: path.basename(target) });
-        const current = this.repo.messages.get(job.placeholderId);
-        if (!current) continue;
-        if ((current.attachments || []).some(item => item?.attachmentId === ref.attachmentId)) continue;
+        const ref = await store.saveFile({ data: new Uint8Array(bytes), name: path.basename(targetPath) });
         const hostPath = store.fileHostPath?.(ref);
-        current.attachments = [...(current.attachments || []), {
-          attachmentId: ref.attachmentId, name: ref.name, bytes: ref.bytes, ...(hostPath ? { path: hostPath } : {}),
-        }];
-        current.updatedAt = now();
-        this.repo.putMessage(current);
-        this.bus.emit(job.groupId, { type: 'message.updated', message: current });
+        const attachment = {
+          attachmentId: ref.attachmentId,
+          name: ref.name,
+          bytes: Number.isSafeInteger(ref.bytes) ? ref.bytes : bytes.byteLength,
+          ...(hostPath ? { path: hostPath } : {}),
+        };
+        await this.recordDeliverableOutcome(job, target, { dedupeKey, attachment });
       } catch (error) {
-        job.deliveredFiles.delete(target);
+        const code = error?.code === 'file-too-large' ? 'file-too-large'
+          : error?.code === 'ENOENT' ? 'not-found' : 'read-or-save-failed';
         this.logger?.warn?.('bot-team: attach presented file failed: ' + String(error?.message || error));
+        await recordFailure(file.path, code, dedupeKey);
       }
     }
   }
-
   // ── public dispatch ──────────────────────────────────────────────────────
   assertQuota(groupId) {
     this.assertAdmission(groupId);
@@ -629,6 +782,9 @@ export class Engine {
     job.stepCount = 0;
     job.finalAnswerText = '';
     job.finalAnswerStep = null;
+    job.finalAnswerExplicit = false;
+    job.deliverablePromises = new Set();
+    job.deliveredKeys = new Set();
     job.requestMetrics = new LastRequestMetrics();
     job.finished = false;
     job.following = [];
@@ -848,7 +1004,7 @@ export class Engine {
     this.bindExecutionTurn(job, payload.turn);
   }
 
-  /** Reattach group observation to already-live native Agents after plugin reload. */
+  /** Reattach group observation to already-live native Agents and historical bindings after plugin reload. */
   async recoverNativeSessions() {
     const query = this.ctx.get?.('sessionQuery');
     for (const member of this.repo.members?.values() || []) {
@@ -898,6 +1054,129 @@ export class Engine {
         this.logger?.warn?.('bot-team: native observation recovery failed: ' + String(error));
       }
     }
+    await this.recoverHistoricalSessions(query);
+  }
+
+  /**
+   * Read events for one session without attaching a cold agent: live snapshot
+   * first, then `sessionQuery.observeSession(id, { projectionMode: 'none' })`,
+   * then `sessionQuery.readSession(id)`.
+   */
+  async readSessionSnapshotForRecovery(sessionId, query) {
+    const agent = this.ctx.agents?.get?.(sessionId);
+    if (agent?.session && typeof agent.session.snapshotEvents === 'function') {
+      return { session: agent.session, events: agent.session.snapshotEvents() };
+    }
+    if (typeof query?.observeSession === 'function') {
+      const obs = await query.observeSession(sessionId, { projectionMode: 'none' });
+      try {
+        const events = Array.isArray(obs?.events) ? [...obs.events] : [];
+        const session = agent?.session || { id: sessionId, header: obs?.header };
+        return { session, events };
+      } finally {
+        try {
+          if (typeof obs?.[Symbol.dispose] === 'function') obs[Symbol.dispose]();
+          else if (typeof obs?.dispose === 'function') obs.dispose();
+        } catch { /* noop */ }
+      }
+    }
+    if (typeof query?.readSession === 'function') {
+      const snap = await query.readSession(sessionId);
+      const events = Array.isArray(snap?.events) ? [...snap.events] : [];
+      const session = agent?.session || { id: sessionId, header: snap?.header };
+      return { session, events };
+    }
+    return null;
+  }
+
+  /**
+   * Recover interrupted or downtime-completed outbox turns for historical
+   * (closed-conversation) sessions on bootstrap/reload, without requiring a
+   * synthetic `turn/start` to be re-emitted.
+   */
+  async recoverHistoricalSessions(query) {
+    const candidateSessionIds = new Set();
+    for (const binding of this.repo.sessionBindings?.values?.() || []) {
+      if (binding?.sessionId) candidateSessionIds.add(binding.sessionId);
+    }
+    for (const message of this.repo.messages?.values?.() || []) {
+      if (message?.status === 'pending' && message.meta?.execution?.sessionId) {
+        candidateSessionIds.add(message.meta.execution.sessionId);
+      }
+    }
+    for (const sessionId of candidateSessionIds) {
+      if (this.disposed) return;
+      if (this.activeBySession.has(sessionId) || this.historicalBySession.has(sessionId)) continue;
+      const binding = this.sessionBinding(sessionId);
+      if (!binding) continue;
+      const current = currentConversationId(this.repo, binding.groupId);
+      if (!current || binding.conversationId === current) continue;
+
+      const groupMessages = this.repo.messagesOf?.(binding.groupId) || [];
+      const sessionMessages = groupMessages.filter(message =>
+        message.conversationId === binding.conversationId
+        && message.author?.type === 'bot'
+        && message.author.botId === binding.botId
+        && message.author.membershipId === binding.membershipId
+        && message.meta?.execution?.sessionId === sessionId);
+      const pendingMessages = sessionMessages.filter(message => message.status === 'pending' && executionTurn(message.meta?.execution?.turn));
+      const pendingTurns = new Set(pendingMessages.map(message => message.meta.execution.turn));
+      let maxRecordedTurn = 0;
+      for (const message of sessionMessages) {
+        const t = message.meta?.execution?.turn;
+        if (executionTurn(t) && t > maxRecordedTurn) maxRecordedTurn = t;
+      }
+
+      try {
+        const snapshot = await this.readSessionSnapshotForRecovery(sessionId, query);
+        if (this.disposed) return;
+        const events = Array.isArray(snapshot?.events) ? snapshot.events : null;
+        if (events && events.length > 0) {
+          const starts = [];
+          for (let i = 0; i < events.length; i += 1) {
+            if (events[i]?.type === 'turn/start' && executionTurn(events[i].data?.turn) && executionSeq(events[i].seq)) {
+              starts.push(i);
+            }
+          }
+          for (let s = 0; s < starts.length; s += 1) {
+            const from = starts[s];
+            const to = s + 1 < starts.length ? starts[s + 1] : events.length;
+            const slice = events.slice(from, to);
+            const start = slice[0];
+            const turn = start.data.turn;
+            if (this.isHistoricalTurnSettled(binding, sessionId, turn)) continue;
+            const isPending = pendingTurns.has(turn);
+            const isNewerThanRecorded = maxRecordedTurn > 0 && turn > maxRecordedTurn;
+            const isLiveInProgress = Boolean(this.ctx.agents?.get?.(sessionId))
+              && !slice.some(ev => ev.type === 'turn/end' && ev.data?.turn === turn);
+            if (!isPending && !isNewerThanRecorded && !isLiveInProgress) continue;
+            const adopted = this.adoptHistoricalTurn(snapshot.session, start);
+            if (!adopted) continue;
+            for (let k = 1; k < slice.length; k += 1) {
+              this.onSessionEvent(snapshot.session, slice[k]);
+            }
+            if (adopted.deliverablePromises?.size) {
+              await Promise.allSettled([...adopted.deliverablePromises]);
+            }
+          }
+          continue;
+        }
+        // No readable session snapshot (e.g. cold session without sessionQuery):
+        // still reattach an unambiguous pending placeholder so live events
+        // (assistant/message, deliverables/presented, turn/end) settle it
+        // without needing another turn/start.
+        if (pendingMessages.length === 1) {
+          this.reattachHistoricalMessage(binding, sessionId, pendingMessages[0]);
+        } else if (pendingMessages.length > 1) {
+          this.logger?.warn?.(`bot-team: ambiguous pending historical replies (${pendingMessages.length}) for session ${sessionId}`);
+        }
+      } catch (error) {
+        this.logger?.warn?.('bot-team: historical session recovery failed: ' + String(error?.message || error));
+        if (pendingMessages.length === 1 && !this.historicalBySession.has(sessionId)) {
+          this.reattachHistoricalMessage(binding, sessionId, pendingMessages[0]);
+        }
+      }
+    }
   }
 
   /** Follow native goals without treating their first completed turn as the task end. */
@@ -941,6 +1220,143 @@ export class Engine {
   }
 
   /**
+   * Match historical messages for `(binding, sessionId, turn)` validating the
+   * full binding identity (group, conversation, bot, membership, session, turn,
+   * and startSeq when both sides carry one).
+   */
+  matchHistoricalMessages(binding, sessionId, turn, startSeq = null) {
+    const all = (this.repo.messagesOf?.(binding.groupId) || []).filter(message =>
+      message.conversationId === binding.conversationId
+      && message.author?.type === 'bot'
+      && message.author.botId === binding.botId
+      && message.author.membershipId === binding.membershipId
+      && message.meta?.execution?.sessionId === sessionId
+      && message.meta.execution.turn === turn);
+    if (all.some(message => message.status !== 'pending')) return { settled: true, pending: null, ambiguous: false };
+    const pending = all.filter(message => message.status === 'pending');
+    if (pending.length > 1 && executionSeq(startSeq)) {
+      const exact = pending.filter(message => message.meta?.execution?.startSeq === startSeq);
+      if (exact.length === 1) return { settled: false, pending: exact[0], ambiguous: false };
+    }
+    if (pending.length > 1) return { settled: false, pending: null, ambiguous: true };
+    return { settled: false, pending: pending[0] ?? null, ambiguous: false };
+  }
+
+  isHistoricalTurnSettled(binding, sessionId, turn) {
+    if (this.settledTurns.get(sessionId)?.has(turn)) return true;
+    return this.matchHistoricalMessages(binding, sessionId, turn).settled === true;
+  }
+
+  buildHistoricalJob({ binding, sessionId, turn, startSeq, jobId, placeholderId, existingExecution }) {
+    const resolvedJobId = typeof jobId === 'string' && jobId.length > 0 ? jobId : newId('job');
+    const resolvedStartSeq = executionSeq(startSeq) ? startSeq : (executionSeq(existingExecution?.startSeq) ? existingExecution.startSeq : null);
+    return {
+      jobId: resolvedJobId,
+      groupId: binding.groupId,
+      conversationId: binding.conversationId,
+      membershipId: binding.membershipId,
+      botId: binding.botId,
+      sessionId,
+      triggerSeq: 0,
+      triggerMessageId: null,
+      kind: 'native',
+      messageKind: 'native',
+      historical: true,
+      submitted: true,
+      nativeInput: true,
+      state: 'running',
+      turn,
+      observedTurn: turn,
+      observedTurnSeq: resolvedStartSeq ?? -1,
+      turnStarts: new Map(),
+      steps: [],
+      streamText: '',
+      stepCount: 0,
+      finalAnswerText: '',
+      finalAnswerStep: null,
+      finalAnswerExplicit: false,
+      deliverablePromises: new Set(),
+      deliveredKeys: new Set(),
+      requestMetrics: new LastRequestMetrics(),
+      following: [],
+      awaitingContinuation: false,
+      ending: false,
+      placeholderId: placeholderId ?? null,
+      execution: {
+        version: 1,
+        jobId: resolvedJobId,
+        sessionId,
+        inputMessageId: existingExecution?.inputMessageId ?? null,
+        turn,
+        startSeq: resolvedStartSeq,
+        endSeq: null,
+        submittedSeq: executionSeq(existingExecution?.submittedSeq) ? existingExecution.submittedSeq : resolvedStartSeq,
+      },
+      done: Promise.resolve(),
+    };
+  }
+
+  reattachHistoricalMessage(binding, sessionId, recorded) {
+    const turn = recorded?.meta?.execution?.turn;
+    if (!executionTurn(turn)) return null;
+    const job = this.buildHistoricalJob({
+      binding,
+      sessionId,
+      turn,
+      startSeq: recorded.meta?.execution?.startSeq,
+      jobId: recorded.meta?.execution?.jobId,
+      placeholderId: recorded.messageId,
+      existingExecution: recorded.meta?.execution,
+    });
+    this.historicalBySession.set(sessionId, job);
+    return job;
+  }
+
+  /**
+   * Reattach an existing unambiguous pending historical placeholder when a
+   * post-reload event (`assistant/message`, `deliverables/presented`, `turn/end`)
+   * arrives without a replayed `turn/start`.
+   */
+  reattachHistoricalPending(session, event) {
+    if (!session?.id || !event || event.type === 'turn/start') return null;
+    if (this.activeBySession.has(session.id) || this.historicalBySession.has(session.id)) return null;
+    const binding = this.sessionBinding(session.id);
+    if (!binding) return null;
+    const current = currentConversationId(this.repo, binding.groupId);
+    if (!current || binding.conversationId === current) return null;
+    const turn = executionTurn(event.data?.turn) ? event.data.turn : null;
+    if (turn !== null) {
+      const match = this.matchHistoricalMessages(binding, session.id, turn);
+      if (match.settled || match.ambiguous || !match.pending) return null;
+      return this.reattachHistoricalMessage(binding, session.id, match.pending);
+    }
+    const pending = (this.repo.messagesOf?.(binding.groupId) || []).filter(message =>
+      message.status === 'pending'
+      && message.conversationId === binding.conversationId
+      && message.author?.type === 'bot'
+      && message.author.botId === binding.botId
+      && message.author.membershipId === binding.membershipId
+      && message.meta?.execution?.sessionId === session.id
+      && executionTurn(message.meta?.execution?.turn));
+    if (pending.length !== 1) return null;
+    return this.reattachHistoricalMessage(binding, session.id, pending[0]);
+  }
+
+  canSupersedeHistorical(historical, session, event) {
+    if (!historical || historical.finished) return false;
+    if (event.type !== 'turn/start' || !executionTurn(event.data?.turn) || !executionSeq(event.seq)) return false;
+    // Only a strictly newer turn (and newer startSeq when known) may supersede.
+    if (event.data.turn <= historical.turn) return false;
+    if (executionSeq(historical.execution?.startSeq) && event.seq <= historical.execution.startSeq) return false;
+    const binding = this.sessionBinding(session.id);
+    if (!binding) return false;
+    const current = currentConversationId(this.repo, binding.groupId);
+    if (!current || binding.conversationId === current) return false;
+    if (this.isHistoricalTurnSettled(binding, session.id, event.data.turn)) return false;
+    return true;
+  }
+
+  /**
    * A turn reported by an old native session after its job already settled
    * (for example a task-centre outbox receipt) still belongs in the original
    * conversation. Such jobs live outside running/activeBySession so queue and
@@ -949,43 +1365,43 @@ export class Engine {
   adoptHistoricalTurn(session, event) {
     if (event.type !== 'turn/start' || !executionTurn(event.data?.turn) || !executionSeq(event.seq)) return null;
     const turn = event.data.turn;
-    const active = this.historicalBySession.get(session.id);
-    if (active) {
-      if (active.turn === turn) return active.finished ? null : active;
-      // A later receipt supersedes an earlier one that never settled (for
-      // example the process stopped between its start and end).
-      if (!active.finished) this.finishJob(active, 'stopped', '上一条回报未结束，已由新回合接替');
-      else this.historicalBySession.delete(session.id);
-    }
     if (this.activeBySession.has(session.id)) return null;
     const binding = this.sessionBinding(session.id);
     if (!binding) return null;
     const current = currentConversationId(this.repo, binding.groupId);
     // A binding pointing at the live conversation is the normal native path.
     if (!current || binding.conversationId === current) return null;
+
+    const active = this.historicalBySession.get(session.id);
+    if (active) {
+      if (active.turn === turn) return active.finished ? null : active;
+      if (!active.finished) {
+        if (!this.canSupersedeHistorical(active, session, event)) return null;
+        this.finishJob(active, 'stopped', '上一条回报未结束，已由新回合接替');
+      } else {
+        this.historicalBySession.delete(session.id);
+      }
+    }
+
     if (this.settledTurns.get(session.id)?.has(turn)) return null;
-    const recorded = (this.repo.messagesOf?.(binding.groupId) || []).find(message =>
-      message.meta?.execution?.sessionId === session.id && message.meta.execution.turn === turn);
-    // A settled row means this receipt is a replay; a pending row means the
-    // host restarted mid-turn and the placeholder must be reused, not doubled.
-    if (recorded && recorded.status !== 'pending') return null;
+    const match = this.matchHistoricalMessages(binding, session.id, turn, event.seq);
+    if (match.settled) return null;
+    if (match.ambiguous) {
+      this.logger?.warn?.(`bot-team: ambiguous pending historical replies for session ${session.id} turn ${turn}`);
+      return null;
+    }
+    const recorded = match.pending;
     const bot = this.repo.getBot(binding.botId);
     if (!bot) return null;
-    const jobId = newId('job');
-    const job = {
-      jobId, groupId: binding.groupId, conversationId: binding.conversationId,
-      membershipId: binding.membershipId, botId: binding.botId, sessionId: session.id,
-      triggerSeq: 0, triggerMessageId: null, kind: 'native', messageKind: 'native',
-      historical: true, submitted: true, nativeInput: true, state: 'running',
-      turn, observedTurn: turn, observedTurnSeq: event.seq, turnStarts: new Map(),
-      steps: [], streamText: '', stepCount: 0, finalAnswerText: '', finalAnswerStep: null,
-      requestMetrics: new LastRequestMetrics(), following: [], awaitingContinuation: false,
-      ending: false, execution: {
-        version: 1, jobId, sessionId: session.id, inputMessageId: null,
-        turn, startSeq: event.seq, endSeq: null, submittedSeq: event.seq,
-      },
-      done: Promise.resolve(),
-    };
+    const job = this.buildHistoricalJob({
+      binding,
+      sessionId: session.id,
+      turn,
+      startSeq: recorded?.meta?.execution?.startSeq ?? event.seq,
+      jobId: recorded?.meta?.execution?.jobId,
+      placeholderId: recorded?.messageId ?? null,
+      existingExecution: recorded?.meta?.execution,
+    });
     try {
       const placeholder = recorded ?? this.createMessage({
         groupId: job.groupId, conversationId: job.conversationId,
@@ -994,14 +1410,13 @@ export class Engine {
         provider: bot.provider ?? null, model: bot.model ?? null, reasoningEffort: bot.reasoningEffort ?? null,
         meta: { nativeSession: true, historical: true, execution: job.execution },
       }, { binding });
-      if (recorded) {
-        recorded.meta = { ...(recorded.meta || {}), historical: true, execution: job.execution };
-        recorded.updatedAt = now();
-        this.repo.putMessage(recorded);
-      }
       job.placeholderId = placeholder.messageId;
       this.historicalBySession.set(session.id, job);
-      if (!recorded) this.bus.emit(job.groupId, { type: 'message.added', message: placeholder });
+      if (recorded) {
+        this.recordExecution(job, job.execution, job.execution.startSeq);
+      } else {
+        this.bus.emit(job.groupId, { type: 'message.added', message: placeholder });
+      }
       return job;
     } catch (error) {
       this.logger?.warn?.('bot-team: historical delivery adoption failed: ' + String(error?.message || error));
@@ -1024,6 +1439,9 @@ export class Engine {
     job.stepCount = 0;
     job.finalAnswerText = '';
     job.finalAnswerStep = null;
+    job.finalAnswerExplicit = false;
+    job.deliverablePromises = new Set();
+    job.deliveredKeys = new Set();
     job.streamAttemptId = null;
     job.usage = null;
     job.requestMetrics = new LastRequestMetrics();
@@ -1043,7 +1461,6 @@ export class Engine {
     this.bus.emit(job.groupId, { type: 'message.added', message });
     return true;
   }
-
   replayFollowing(job) {
     const following = job.following?.splice(0) || [];
     for (const item of following) {
@@ -1059,13 +1476,12 @@ export class Engine {
     if (live?.session && live.session !== session) return;
     if (event.type === 'turn/end') this.discussionRunner.nativeSettled(session.id);
     const historical = this.historicalBySession.get(session.id);
-    // A newer receipt must be able to supersede a historical turn that never
-    // settled; adoptHistoricalTurn settles the old one before creating the new.
-    const supersede = historical && event.type === 'turn/start'
-      && executionTurn(event.data?.turn) && event.data.turn !== historical.turn;
+    const supersede = this.canSupersedeHistorical(historical, session, event);
     const job = this.activeBySession.get(session.id)
       || (supersede ? (this.adoptHistoricalTurn(session, event) || historical) : historical)
-      || this.adoptNativeTurn(session, event) || this.adoptHistoricalTurn(session, event);
+      || this.adoptNativeTurn(session, event)
+      || this.adoptHistoricalTurn(session, event)
+      || this.reattachHistoricalPending(session, event);
     if (!job || job.finished || (!this.isCurrentJob(job) && !this.isLateDelivery(job) && !this.isHistoricalJob(job))) return;
     if (job.ending) { job.following.push({ session, event }); return; }
     const data = event.data || {};
@@ -1127,24 +1543,33 @@ export class Engine {
     if (executionSeq(event.seq) && executionSeq(job.execution.startSeq) && event.seq < job.execution.startSeq) return;
 
     if (event.type === 'turn/end' && data.turn === job.turn && correlated && executionSeq(event.seq)) {
+      const pendingDeliverables = job.deliverablePromises?.size ? [...job.deliverablePromises] : [];
       if (job.historical === true) {
+        if (pendingDeliverables.length > 0) {
+          job.ending = true;
+          void Promise.allSettled(pendingDeliverables)
+            .then(() => {
+              job.execution = { ...job.execution, endSeq: event.seq };
+              this.finishTurn(job, data.reason);
+            });
+          return;
+        }
         job.execution = { ...job.execution, endSeq: event.seq };
         this.finishTurn(job, data.reason);
         return;
       }
       job.ending = true;
-      void this.persistExecution(job, { endSeq: event.seq }, event.seq)
+      const persistEnd = pendingDeliverables.length > 0
+        ? Promise.allSettled(pendingDeliverables).then(() => this.persistExecution(job, { endSeq: event.seq }, event.seq))
+        : this.persistExecution(job, { endSeq: event.seq }, event.seq);
+      void persistEnd
         .then(() => this.finishTurn(job, data.reason))
         .catch((error) => this.executionFailed(job, error));
       return;
     }
     if (executionSeq(event.seq) && executionEvent(event.type) && job.historical !== true) this.emitExecutionUpdated(job, event.seq);
     if (event.type === 'deliverables/presented' && data.turn === job.turn) {
-      // Reuse the native attachment store; never let a failed projection fail
-      // the turn or delay its settlement.
-      void this.projectDeliverables(job, data).catch((error) => {
-        this.logger?.warn?.('bot-team: project presented files failed: ' + String(error?.message || error));
-      });
+      this.enqueueDeliverables(job, session, event);
       return;
     }
     if (event.type === 'approval/asked') {
@@ -1174,10 +1599,17 @@ export class Engine {
         // A final answer never carries a tool call. With recorded phases, every
         // phase on the message must be final_answer: a mixed message could hide
         // commentary text in the same blocks, so it is not published.
-        const provenFinal = !hasToolCall && (phases.length === 0 || phases.every(phase => phase === 'final_answer'));
-        if (messageText && provenFinal) {
+        const explicitFinal = !hasToolCall && phases.length > 0 && phases.every(phase => phase === 'final_answer');
+        const heuristicFinal = !hasToolCall && phases.length === 0;
+        if (messageText && (explicitFinal || heuristicFinal)) {
           job.finalAnswerText = messageText;
           job.finalAnswerStep = job.stepCount;
+          job.finalAnswerExplicit = explicitFinal;
+        } else if (hasToolCall && job.finalAnswerExplicit !== true) {
+          // A subsequent tool call disproves an earlier unphased text-only step
+          // as the turn's final answer.
+          job.finalAnswerText = '';
+          job.finalAnswerStep = null;
         }
         if (event.data.usage) job.usage = event.data.usage;
         return;
@@ -1195,7 +1627,15 @@ export class Engine {
       }
       return;
     }
-    if (event.type === 'turn/end' && data.turn === job.turn) this.finishTurn(job, data.reason);
+    if (event.type === 'turn/end' && data.turn === job.turn) {
+      const pendingDeliverables = job.deliverablePromises?.size ? [...job.deliverablePromises] : [];
+      if (pendingDeliverables.length > 0) {
+        job.ending = true;
+        void Promise.allSettled(pendingDeliverables).then(() => this.finishTurn(job, data.reason));
+        return;
+      }
+      this.finishTurn(job, data.reason);
+    }
   }
 
   finishTurn(job, reason = {}) {
@@ -1311,18 +1751,20 @@ export class Engine {
   }
 
   /** Reply body: the full step transcript, or only the turn's final answer. */
-  projectedText(job) {
+  projectedText(job, status = 'done') {
     if (this.config.resultMode !== 'final') {
       return ((job.steps || []).filter(Boolean).join('\n\n') || job.streamText || '').trim();
     }
     // Without a proven final answer the body stays empty: status, error and
     // approval cards already carry the necessary state, and internal
-    // commentary must never reach the timeline.
+    // commentary must never reach the timeline. On stopped/error turns, an
+    // unphased heuristic candidate is never promoted to a final answer.
+    if (status !== 'done' && job.finalAnswerExplicit !== true) return '';
     return typeof job.finalAnswerText === 'string' ? job.finalAnswerText.trim() : '';
   }
 
   settleMessage(job, status, error, options = {}) {
-    const text = this.projectedText(job);
+    const text = this.projectedText(job, status);
     const message = job.placeholderId ? this.repo.messages.get(job.placeholderId) : undefined;
     // Never persist or broadcast a reply this job cannot prove it owns.
     if (message && !this.canSettleMessage(job, message)) {

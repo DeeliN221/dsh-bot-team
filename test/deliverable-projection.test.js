@@ -189,3 +189,67 @@ test('a released Agent still projects files through the group workspace', async 
   assert.equal(f.message(job).attachments.length, 1);
   assert.equal(f.message(job).attachments[0].name, 'after-release.md');
 });
+
+test('slow deliverable projection stays pinned to its original turn across continuation and awaits before turn/end', async t => {
+  const f = await fixture(t);
+  await writeFile(f.fileOf('report.md'), 'TURN1-CONTENT');
+  let releaseSave;
+  const origSave = f.ctx?.get?.('attachments')?.saveFile;
+  // Delay saveFile by injecting a slow attachment store on engine.ctx
+  const saveGate = new Promise(resolve => { releaseSave = resolve; });
+  const savedRefs = [];
+  const slowStore = {
+    async saveFile({ data, name }) {
+      await saveGate;
+      const ref = { attachmentId: 'slow-' + (savedRefs.length + 1), name, bytes: data.byteLength };
+      savedRefs.push({ ref, text: Buffer.from(data).toString('utf8') });
+      return ref;
+    },
+    fileHostPath: ref => path.join(f.root, ref.name),
+  };
+  f.engine.ctx = { ...f.engine.ctx, get: name => (name === 'attachments' ? slowStore : name === 'goals' ? { get: () => ({ phase: 'active', activation: 'armed' }) } : undefined) };
+  const { job } = await f.post();
+  f.begin(job, 1);
+  const turn1MsgId = job.placeholderId;
+  f.event(job, 'deliverables/presented', { turn: 1, callId: 'c1', files: [{ path: 'report.md' }] });
+  // turn/end + continuation turn/start arrive while saveFile is still pending!
+  f.event(job, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+  f.event(job, 'turn/start', { turn: 2 });
+  await f.flush();
+  // Turn 1 must still be pending while deliverable projection is in flight
+  assert.equal(f.repo.getMessage(turn1MsgId).status, 'pending');
+  releaseSave();
+  await f.flush();
+  const msg1 = f.repo.getMessage(turn1MsgId);
+  assert.equal(msg1.status, 'done');
+  assert.equal(msg1.attachments.length, 1);
+  assert.equal(msg1.attachments[0].attachmentId, 'slow-1');
+  // Turn 2 gets its own placeholder and did NOT steal turn 1's attachment
+  assert.notEqual(job.placeholderId, turn1MsgId);
+  const msg2 = f.repo.getMessage(job.placeholderId);
+  assert.equal(msg2.attachments.length, 0);
+
+  // Now update the SAME path in turn 2 and present again — must NOT be skipped!
+  await writeFile(f.fileOf('report.md'), 'TURN2-UPDATED');
+  f.event(job, 'user/message', { id: 'u2', turn: 2 });
+  f.event(job, 'deliverables/presented', { turn: 2, callId: 'c1', files: [{ path: 'report.md' }] });
+  f.event(job, 'turn/end', { turn: 2, reason: { kind: 'completed' } });
+  await f.flush();
+  const msg2After = f.repo.getMessage(msg2.messageId);
+  assert.equal(msg2After.attachments.length, 1);
+  assert.equal(msg2After.attachments[0].attachmentId, 'slow-2');
+  assert.equal(savedRefs[1].text, 'TURN2-UPDATED');
+});
+
+test('deliverable failures are recorded visibly on message metadata', async t => {
+  const f = await fixture(t);
+  await writeFile(f.outsideFileOf('secret.txt'), 'nope');
+  const { job } = await f.post();
+  f.begin(job);
+  f.present(job, [{ path: f.outsideFileOf('secret.txt') }, { path: 'missing.md' }]);
+  await f.flush();
+  const msg = f.message(job);
+  assert.equal(msg.attachments.length, 0);
+  assert.equal(Array.isArray(msg.meta?.deliverableFailures), true);
+  assert.deepEqual(msg.meta.deliverableFailures.map(item => item.reason), ['outside-workspace', 'not-found']);
+});
