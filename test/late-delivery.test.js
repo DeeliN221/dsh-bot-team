@@ -388,3 +388,140 @@ test('an outbox turn replayed after reload is delivered once and deduplicated', 
   await f.flush();
   assert.equal(f.repo.messages.size, afterSecond);
 });
+
+test('a reload in the middle of an outbox turn reuses the pending reply', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  await f.flush();
+  const pending = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].status, 'pending');
+
+  const next = f.reload();
+  f.emitOn(next, 'session-1', 'turn/start', { turn: 7 });
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 7, message: { content: [{ type: 'text', text: 'RESUMED RESULT' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 1, 'a pending placeholder is reused across reload');
+  assert.equal(native[0].messageId, pending[0].messageId);
+  assert.equal(native[0].status, 'done');
+  assert.equal(native[0].text, 'RESUMED RESULT');
+});
+
+test('a new historical turn supersedes one that never settled', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  await f.flush();
+  f.emit('session-1', 'turn/start', { turn: 8 });
+  f.emit('session-1', 'assistant/message', { turn: 8, message: { content: [{ type: 'text', text: 'NEWER RESULT' }] } });
+  f.emit('session-1', 'turn/end', { turn: 8, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 2);
+  assert.equal(native[0].status, 'stopped');
+  assert.equal(native[0].text, '');
+  assert.equal(native[1].status, 'done');
+  assert.equal(native[1].text, 'NEWER RESULT');
+});
+
+test('an owned cancel still settles after the member record is gone', async t => {
+  const f = fixture(t);
+  const { job } = await f.post();
+  f.begin(job);
+  f.answer(job, 'PARTIAL');
+  // The binding survives the membership; the job persisted its botId at start.
+  f.repo.members.delete('member');
+  f.engine.abortJob(job, 'user');
+  await f.flush();
+  const message = f.repo.getMessage(job.placeholderId);
+  assert.equal(job.state, 'stopped');
+  assert.equal(message.status, 'stopped');
+  assert.equal(message.error, '已停止');
+});
+
+test('reload mid-turn recovers via recoverNativeSessions without re-injecting turn/start', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  await f.flush();
+  const pending = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].status, 'pending');
+  const originalJobId = pending[0].meta.execution.jobId;
+
+  const next = f.reload();
+  await next.recoverNativeSessions();
+  // No synthetic turn/start is emitted — only the remaining assistant/message and turn/end!
+  f.emitOn(next, 'session-1', 'assistant/message', { turn: 7, message: { content: [{ type: 'text', text: 'AUTO RECOVERED' }] } });
+  f.emitOn(next, 'session-1', 'turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 1);
+  assert.equal(native[0].messageId, pending[0].messageId);
+  assert.equal(native[0].meta.execution.jobId, originalJobId);
+  assert.equal(native[0].status, 'done');
+  assert.equal(native[0].text, 'AUTO RECOVERED');
+});
+
+test('downtime-completed historical turn is recovered via sessionQuery.observeSession and disposed', async t => {
+  const f = fixture(t);
+  // First record conv-1 turn 1 so maxRecordedTurn = 1
+  const { job } = await f.post();
+  f.begin(job, 1);
+  f.answer(job, 'INITIAL');
+  f.end(job, 1);
+  await f.flush();
+  f.switchConversation();
+
+  // Simulate session-1 going cold (removed from live agents) and completing turn 2 during downtime
+  f.agents.delete('session-1');
+  let disposed = 0;
+  f.repo.sessionBindings = f.bindings;
+  const coldEvents = [
+    { seq: 10, type: 'turn/start', data: { turn: 2 } },
+    { seq: 11, type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'DOWNTIME OUTBOX' }] } } },
+    { seq: 12, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+  ];
+  const next = f.reload();
+  next.ctx = {
+    ...next.ctx,
+    get: name => (name === 'sessionQuery' ? {
+      observeSession: async (id, opts) => {
+        assert.equal(id, 'session-1');
+        assert.equal(opts?.projectionMode, 'none');
+        return {
+          header: { id: 'session-1' },
+          events: coldEvents,
+          [Symbol.dispose]() { disposed += 1; },
+        };
+      },
+    } : undefined),
+  };
+  await next.recoverNativeSessions();
+  await f.flush();
+  assert.equal(disposed, 1);
+  const historical = f.repo.messagesOf('group').filter(m => m.meta?.historical === true);
+  assert.equal(historical.length, 1);
+  assert.equal(historical[0].status, 'done');
+  assert.equal(historical[0].text, 'DOWNTIME OUTBOX');
+  assert.equal(historical[0].conversationId, 'conv-1');
+});
+
+test('out-of-order or replayed older turn/start never stops a newer active historical turn', async t => {
+  const f = fixture(t);
+  f.switchConversation();
+  f.emit('session-1', 'turn/start', { turn: 8 });
+  await f.flush();
+  // Replay older turn 7 start while turn 8 is running
+  f.emit('session-1', 'turn/start', { turn: 7 });
+  f.emit('session-1', 'assistant/message', { turn: 8, message: { content: [{ type: 'text', text: 'TURN 8 SURVIVED' }] } });
+  f.emit('session-1', 'turn/end', { turn: 8, reason: { kind: 'completed' } });
+  await f.flush();
+  const native = f.repo.messagesOf('group').filter(message => message.kind === 'native');
+  assert.equal(native.length, 1);
+  assert.equal(native[0].status, 'done');
+  assert.equal(native[0].text, 'TURN 8 SURVIVED');
+});

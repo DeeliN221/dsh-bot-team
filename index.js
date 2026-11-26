@@ -21,10 +21,15 @@ export function apply(ctx, rawConfig = {}) {
   const config = resolveConfig(rawConfig && typeof rawConfig === 'object' ? rawConfig : {});
   const service = new BotTeamService(ctx, config);
   ctx.effect(() => () => service.dispose(), 'bot-team lifecycle');
-  // Identity is read through the live service; repo/pool appear after `ready`.
+  // Identity is read through the live service; `isReady` flips true only after
+  // migrations, pool.ready, recovery, and lineage warmup finish.
   const identity = createIdentityService(ctx, () => service);
+  service.onBeforeReady = () => identity.warmLineage();
   ctx.effect(() => {
     const unprovide = ctx.provide(IDENTITY_SERVICE_NAME, identity);
-    return () => { unprovide(); identity.dispose(); };
+    return async () => {
+      identity.dispose();
+      await Promise.resolve(unprovide?.()).catch(() => {});
+    };
   }, 'bot-team identity');
 }

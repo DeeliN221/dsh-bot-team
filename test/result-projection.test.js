@@ -244,3 +244,28 @@ test('final mode resets the projection across a native continuation', async t =>
   assert.equal(f.message(job).status, 'done');
   assert.equal(first.text, 'FIRST ANSWER');
 });
+
+test('final mode: unphased text-only progress followed by a failing tool call is never published', async t => {
+  const f = fixture(t, { resultMode: 'final' });
+  const { job } = await f.post();
+  f.begin(job);
+  f.event(job, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'Let me inspect the repo...' }] } });
+  f.event(job, 'assistant/message', { turn: 1, message: { content: [{ type: 'tool-call', id: 'tc1', name: 'bash', input: {} }] } });
+  f.event(job, 'turn/end', { turn: 1, reason: { kind: 'error', error: { message: 'boom' } } });
+  await f.flush();
+  const msg = f.repo.getMessage(job.placeholderId);
+  assert.equal(msg.status, 'error');
+  assert.equal(msg.text, '');
+});
+
+test('final mode: unphased text-only progress on an aborted turn is not published as final', async t => {
+  const f = fixture(t, { resultMode: 'final' });
+  const { job } = await f.post();
+  f.begin(job);
+  f.event(job, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'Working on it...' }] } });
+  f.event(job, 'turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+  await f.flush();
+  const msg = f.repo.getMessage(job.placeholderId);
+  assert.equal(msg.status, 'stopped');
+  assert.equal(msg.text, '');
+});
