@@ -123,6 +123,17 @@ export function parentSessionIdOf(agent) {
   return undefined;
 }
 
+/**
+ * Optional host-projected creation catalog on a live parent Agent.
+ *
+ * The 0.2.3 `Agent` contract exposes only `id`; `Session.projections` is private
+ * and the real direct-child catalog is readable only through the asynchronous
+ * `sessionQuery.observeSession(id).projections.values.subagentCatalog` (the
+ * SDK's own `listChildren`). This synchronous hook therefore stays for hosts or
+ * test doubles that project a catalog themselves, and returns `null` on the
+ * real runtime, where verified lineage comes from `subagent/start`,
+ * `ctx.subagents.rootOf`, and the factory-set durable `origin`/`delegationDepth`.
+ */
 function catalogContainsChild(parentAgent, childId) {
   const catalog = parentAgent?.projections?.values?.subagentCatalog;
   if (!Array.isArray(catalog)) return null; // catalog unavailable
@@ -133,10 +144,11 @@ function catalogContainsChild(parentAgent, childId) {
  * Verify that an Agent is a real native subagent child (not an ordinary
  * historical fork that merely retained `parentSession`).
  *
- * In DSH 0.2.3, `ReactLoopAgent` does not expose `parentAgent`; creation edges
- * are proven by `header.origin === 'subagent'` together with `ctx.subagents.rootOf`,
- * parent `subagentCatalog`, durable `delegationDepth >= 1`, or (in legacy test
- * doubles) `agent.parentAgent`.
+ * In DSH 0.2.3, `ReactLoopAgent` exposes only `id`: neither `parentAgent` nor a
+ * public `projections` catalog exists. Creation edges are proven by
+ * `header.origin === 'subagent'` together with `ctx.subagents.rootOf`, the
+ * factory-set durable `delegationDepth >= 1` / `parentSession` metadata, or (in
+ * legacy test doubles) `agent.parentAgent` or a projected `subagentCatalog`.
  */
 export function isNativeSubagent(agent, ctx) {
   if (!agent) return false;
@@ -282,9 +294,12 @@ export function createIdentityService(ctx, service) {
       const root = resolveRootFromParent(parentId);
       if (root) setLineage(childId, root);
     }
-    // Inspect already-live agents if the host exposes iterable agents.
-    const liveAgents = typeof ctx?.agents?.values === 'function' ? [...ctx.agents.values()] : [];
-    for (const agent of liveAgents) remember(agent);
+    // Inspect already-live agents. The real 0.2.3 registry exposes `list()`;
+    // a Map-like double may expose only `values()`.
+    const registry = ctx?.agents;
+    const liveAgents = typeof registry?.list === 'function' ? registry.list()
+      : typeof registry?.values === 'function' ? [...registry.values()] : [];
+    for (const agent of Array.isArray(liveAgents) ? liveAgents : []) remember(agent);
 
     const subagents = ctx?.get?.('subagents');
     if (typeof subagents?.listDescendants !== 'function') return;
@@ -301,7 +316,13 @@ export function createIdentityService(ctx, service) {
     for (const rootSessionId of roots) {
       try {
         const listed = await subagents.listDescendants(rootSessionId);
-        for (const child of listed?.children || []) {
+        // Real 0.2.3 `SubagentRuntime.listDescendants(rootId)` resolves a flat
+        // array of `{ kind: 'child'|'diagnostic', id, parentId, depth }`; only a
+        // legacy double wrapped it as `{ children }`. Every returned row is a
+        // proven catalog descendant of the Bot root, diagnostics included.
+        const entries = Array.isArray(listed) ? listed
+          : Array.isArray(listed?.children) ? listed.children : [];
+        for (const child of entries) {
           if (text(child?.id)) setLineage(child.id, rootSessionId);
         }
       } catch {
