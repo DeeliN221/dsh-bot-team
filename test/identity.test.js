@@ -167,7 +167,10 @@ test('real DSH 0.2.3 subagent without parentAgent inherits via subagent/start an
   const child2 = { id: 'child-sdk-2', session: { header: { id: 'child-sdk-2', origin: 'subagent', parentSession: 'child-sdk-1', delegationDepth: 2 } } };
   const subagents = {
     rootOf: agent => (agent.id === 'child-sdk-2' ? rootAgent : agent),
-    listDescendants: async rootId => (rootId === 'session-bot' ? { children: [{ id: 'child-cold-3' }] } : { children: [] }),
+    // Real 0.2.3 shape: a flat array of catalog rows, not `{ children }`.
+    listDescendants: async rootId => (rootId === 'session-bot'
+      ? [{ kind: 'child', id: 'child-cold-3', parentId: 'session-bot', depth: 1 }]
+      : []),
   };
   ctx.get = name => (name === 'subagents' ? subagents : undefined);
   const identity = createIdentityService(ctx, { repo, pool, isReady: true });
@@ -186,7 +189,15 @@ test('real DSH 0.2.3 subagent without parentAgent inherits via subagent/start an
   await identity.warmLineage();
   assert.equal(identity.resolve('child-cold-3')?.botId, 'bot');
   assert.equal(identity.resolve('child-cold-3')?.rootSessionId, 'session-bot');
-  // Forged child absent from live parent subagentCatalog is rejected
+  // A durable child pointing at a non-Bot parent is never verified from the
+  // parent string alone (the 0.2.3 real-runtime path, no projected catalog).
+  const stranger = { id: 'stranger-1', session: { header: { id: 'stranger-1', origin: 'subagent', parentSession: 'session-foreign', delegationDepth: 1 } } };
+  agents.set('stranger-1', stranger);
+  ctx.emitCreated(stranger);
+  assert.equal(identity.resolve('stranger-1'), undefined);
+  assert.equal(identity.describe('stranger-1').knownBot, false);
+  // Host double that projects a live parent catalog (optional hook, not part of
+  // the 0.2.3 Agent contract): a child absent from it is rejected.
   rootAgent.projections = { values: { subagentCatalog: [{ id: 'child-sdk-1' }] } };
   const forged = { id: 'forged-1', session: { header: { id: 'forged-1', origin: 'subagent', parentSession: 'session-bot', delegationDepth: 1 } } };
   agents.set('forged-1', forged);

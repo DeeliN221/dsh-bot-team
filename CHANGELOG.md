@@ -17,6 +17,7 @@
 ### 调整与修复
 
 - `package.json` 版本升至 1.3.1；集成测试改为读取 `PLUGIN_INFO.version`，不再硬编码版本号。
+- 子代理谱系预热改按 DSH 0.2.3 真实契约读取：`ctx.subagents.listDescendants` 返回目录行数组（非 `{children}`），在线 Agent 通过 `AgentRegistry.list()` 枚举；`Agent` 只保证 `id`，不暴露 `parentAgent`/`projections`，目录投影仅保留给显式投影的宿主与测试替身。
 - 新增顾问身份、结果投影、文件交付文档（`docs/advisor-identity.md`）。
 
 ## 1.3.0 — 2026-10-28
