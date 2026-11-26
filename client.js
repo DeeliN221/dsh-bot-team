@@ -13742,7 +13742,7 @@ button.bt-discussion-tip:hover .bt-discussion-tip-text { color: var(--bt-text-2)
               hasCurrentDiscussion && currentDiscussion.discussionId === dialog.discussionId
                 ? h(DiscussionProgress, { key: currentDiscussion.discussionId, contextId: currentDiscussion.discussionId + '-detail', discussion: currentDiscussion, group: activeGroup, members, bots: state.bots, messages, onUpdated: updateDiscussion, onConversationError: mergeConversationError }) : null,
               h(DiscussionResult, { key: dialog.discussionId, discussion: currentDiscussion?.discussionId === dialog.discussionId ? currentDiscussion : null, discussionId: dialog.discussionId, mode: dialog.mode, group: activeGroup, bots: state.bots, deletedMessageIds: state.deletedMessageIdsByGroup[activeGroup.groupId], onUpdated: updateDiscussion, onJumpToMessage: jumpToDiscussionMessage, initiallyExpanded: true })) : null,
-        state.loading ? h('div', { className: 'bt-root', style: { ...S.overlay, background: 'var(--bt-loading)' } }, h('div', { style: { fontSize: 13, color: 'var(--bt-text-2)' } }, '加载 Bot Team…')) : null,
+        state.loading ? h('div', { className: 'bt-root', style: { ...S.overlay, position: 'absolute', background: 'var(--bt-loading)' } }, h('div', { style: { fontSize: 13, color: 'var(--bt-text-2)' } }, '加载 Bot Team…')) : null,
       );
       // Keep the chat mounted so returning restores its draft, scroll and source
       // message. The execution drawer unmounts while this distinct page is open.
